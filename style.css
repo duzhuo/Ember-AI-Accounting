@@ -231,12 +231,10 @@ body {
 
 /* Workspace (Right) */
 .workspace {
-    overflow-y: auto;
-    padding: var(--spacing-lg);
-    gap: var(--spacing-lg);
+    overflow: hidden;
     position: relative;
-    /* transition: all 0.3s ease; */
-    /* Removed global transition to avoid layout jank */
+    display: flex;
+    flex-direction: column;
 }
 
 /* Initial Empty State */
@@ -626,48 +624,142 @@ body {
     white-space: nowrap;
 }
 
-/* ── Workspace Tabs ───────────────────────────────────────────────────────── */
+/* ── Workspace (Right Panel) ──────────────────────────────────────────────── */
 
-.workspace-tabs {
+.workspace {
+    overflow: hidden;
+    position: relative;
     display: flex;
-    border-bottom: 1px solid var(--border-color);
-    padding: 0 var(--spacing-lg);
-    background: var(--glass-bg);
+    flex-direction: column;
 }
 
-.workspace-tab {
+/* ── View Header ───────────────────────────────────────────────────────────── */
+
+.view-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     padding: 12px 20px;
-    border: none;
-    background: none;
-    cursor: pointer;
-    font-size: 0.9rem;
-    font-weight: 500;
-    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    background: var(--glass-bg);
+    flex-shrink: 0;
+}
+
+.view-header h2 {
+    font-size: 1rem;
+    font-weight: 600;
     display: flex;
     align-items: center;
     gap: 6px;
-    border-bottom: 2px solid transparent;
-    transition: all 0.2s;
-}
-
-.workspace-tab:hover {
     color: var(--text-main);
 }
 
-.workspace-tab.active {
+.view-header h2 i {
     color: var(--primary-color);
-    border-bottom-color: var(--primary-color);
 }
 
-.tab-content {
+/* ── View Content ───────────────────────────────────────────────────────────── */
+
+.view-content {
     display: none;
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--spacing-lg);
+    gap: var(--spacing-lg);
+}
+
+.view-content.active {
+    display: flex;
+    flex-direction: column;
+}
+
+.view-scroll-area {
     flex: 1;
     overflow-y: auto;
 }
 
-.tab-content.active {
+.view-toolbar {
     display: flex;
-    flex-direction: column;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-lg);
+    flex-shrink: 0;
+}
+
+.view-toolbar-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.view-count {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.view-toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.view-loading {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+}
+
+.view-loading i {
+    font-size: 2rem;
+    display: block;
+    margin-bottom: 12px;
+}
+
+.view-empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+}
+
+.view-empty-state i {
+    font-size: 2rem;
+    display: block;
+    margin-bottom: 12px;
+}
+
+/* ── Empty State with Hint Cards ──────────────────────────────────────────── */
+
+.empty-hints {
+    display: flex;
+    gap: 12px;
+    margin-top: 24px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.hint-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: white;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-size: 0.9rem;
+    color: var(--text-main);
+}
+
+.hint-card:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+    box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
+}
+
+.hint-card i {
+    font-size: 1.1rem;
+    color: var(--primary-color);
 }
 
 /* ── Rules View ──────────────────────────────────────────────────────────── */

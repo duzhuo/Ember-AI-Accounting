@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=9">
+    <link rel="stylesheet" href="style.css?v=10">
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
 </head>
 
@@ -63,8 +63,13 @@
                         <ul>
                             <li><strong>销售收入</strong> — 销售商品或提供服务产生的收入</li>
                         </ul>
-                        <p>📎 <strong>支持的上传格式：</strong>Excel (.xlsx/.xls) / 图片 (.png/.jpg 等) / PDF (.pdf)</p>
-                        <p>你可以试着说：<em>"销售软件产品给华为公司，不含税金额100000元，税率13%"</em>，或上传销售发票 Excel / 发票照片 / PDF。</p>
+                        <p>📎 <strong>支持的上传格式：</strong>Excel / 图片 / PDF</p>
+                        <p>💬 <strong>你可以试试：</strong></p>
+                        <ul>
+                            <li><em>"销售软件产品给华为公司，不含税金额100000元"</em></li>
+                            <li><em>"查看我的凭证"</em> — 查看已生成的凭证记录</li>
+                            <li><em>"凭证规则"</em> — 查看记账规则</li>
+                        </ul>
                     </div>
                 </div>
             </div>
@@ -74,7 +79,7 @@
                     <button class="attachment-btn" id="uploadBtn" title="上传文件">
                         <i class="ph ph-paperclip"></i>
                     </button>
-                    <textarea id="userInput" placeholder="描述交易内容或上传文件..." rows="1"></textarea>
+                    <textarea id="userInput" placeholder="描述交易、查看凭证、查看规则..." rows="1"></textarea>
                     <button class="send-btn" id="sendBtn">
                         <i class="ph ph-paper-plane-right"></i>
                     </button>
@@ -83,33 +88,41 @@
             </div>
         </aside>
 
-        <!-- Right Panel: Workspace -->
-        <main class="workspace glass-panel">
-            <!-- Workspace Tab Bar -->
-            <div class="workspace-tabs">
-                <button class="workspace-tab active" data-tab="voucher" id="tabVoucher">
-                    <i class="ph ph-receipt"></i> 凭证
-                </button>
-                <button class="workspace-tab" data-tab="history" id="tabHistory">
-                    <i class="ph ph-clock-counter-clockwise"></i> 凭证记录
-                </button>
-                <button class="workspace-tab" data-tab="rules" id="tabRules">
-                    <i class="ph ph-list-dashes"></i> 凭证规则
-                </button>
-                <button class="workspace-tab" data-tab="users" id="tabUsers" style="display:none;">
-                    <i class="ph ph-users"></i> 用户管理
-                </button>
+        <!-- Right Panel: Dynamic View -->
+        <main class="workspace glass-panel" id="workspacePanel">
+            <!-- View Header - shows current view name + back button -->
+            <div class="view-header" id="viewHeader" style="display:none;">
+                <button class="icon-btn" id="viewBackBtn" title="返回"><i class="ph ph-arrow-left"></i></button>
+                <h2 id="viewTitle">—</h2>
             </div>
 
-            <!-- Tab: Voucher -->
-            <div class="tab-content active" id="tabContentVoucher">
-                <div id="initialState" class="empty-state-large">
+            <!-- View: Empty / Welcome -->
+            <div class="view-content active" id="viewEmpty">
+                <div class="empty-state-large">
                     <div class="icon-pulse"><i class="ph ph-sparkle"></i></div>
                     <h3>等待指令</h3>
                     <p>请在左侧描述业务或上传单据，AI 将为您生成凭证。</p>
+                    <div class="empty-hints">
+                        <div class="hint-card" data-hint="查看我的凭证">
+                            <i class="ph ph-receipt"></i>
+                            <span>查看凭证</span>
+                        </div>
+                        <div class="hint-card" data-hint="凭证规则">
+                            <i class="ph ph-list-dashes"></i>
+                            <span>凭证规则</span>
+                        </div>
+                        <div class="hint-card" data-hint="销售软件产品给XX公司，不含税金额100000元，税率13%">
+                            <i class="ph ph-plus-circle"></i>
+                            <span>生成凭证</span>
+                        </div>
+                    </div>
                 </div>
+            </div>
 
-                <div id="workspaceContent" style="display: none;">
+            <!-- View: Voucher Detail (dynamically rendered) -->
+            <div class="view-content" id="viewVoucher">
+                <div id="voucherInitialState" style="display:none;"></div>
+                <div id="voucherWorkspaceContent" style="display: none;">
                     <div class="section source-data-section">
                         <div class="section-header">
                             <h2>原始凭证 / 数据源</h2>
@@ -205,108 +218,24 @@
                 </div>
             </div>
 
-            <!-- Tab: Voucher History -->
-            <div class="tab-content" id="tabContentHistory">
-                <div class="history-container" id="historyContainer">
-                    <div class="history-toolbar">
-                        <div class="history-filters">
-                            <select id="historyStatusFilter" class="history-select">
-                                <option value="">全部状态</option>
-                                <option value="draft">草稿</option>
-                                <option value="posted">已过账</option>
-                            </select>
-                        </div>
-                        <button class="btn btn-secondary" id="refreshHistoryBtn">
-                            <i class="ph ph-arrows-clockwise"></i> 刷新
-                        </button>
-                    </div>
-                    <div class="history-loading" id="historyLoading" style="display:none;">
-                        <i class="ph ph-spinner ph-spin"></i> 加载凭证记录...
-                    </div>
-                    <div class="history-empty" id="historyEmpty" style="display:none;">
-                        <i class="ph ph-receipt"></i> 暂无凭证记录
-                    </div>
-                    <div class="history-list" id="historyList" style="display:none;"></div>
-                </div>
+            <!-- View: Voucher List (dynamically rendered) -->
+            <div class="view-content" id="viewVoucherList">
+                <div id="voucherListContent" class="view-scroll-area"></div>
             </div>
 
-            <!-- Tab: Voucher Rules -->
-            <div class="tab-content" id="tabContentRules">
-                <div class="rules-container" id="rulesContainer">
-                    <div class="rules-loading" id="rulesLoading">
-                        <i class="ph ph-spinner ph-spin"></i> 加载凭证规则中...
-                    </div>
-                    <div class="rules-empty" id="rulesEmpty" style="display:none;">
-                        <i class="ph ph-warning-circle"></i> 暂无凭证规则配置
-                    </div>
-                    <div class="rules-list" id="rulesList" style="display:none;"></div>
-                </div>
+            <!-- View: Rules (dynamically rendered) -->
+            <div class="view-content" id="viewRules">
+                <div id="rulesContent" class="view-scroll-area"></div>
             </div>
 
-            <!-- Tab: User Management (admin only) -->
-            <div class="tab-content" id="tabContentUsers">
-                <div class="users-container" id="usersContainer">
-                    <div class="users-toolbar">
-                        <h2>用户管理</h2>
-                        <button class="btn btn-primary" id="addUserBtn">
-                            <i class="ph ph-plus"></i> 添加用户
-                        </button>
-                    </div>
-                    <table class="users-table" id="usersTable">
-                        <thead>
-                            <tr>
-                                <th>用户名</th>
-                                <th>显示名称</th>
-                                <th>角色</th>
-                                <th>状态</th>
-                                <th>创建时间</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="usersTableBody"></tbody>
-                    </table>
-                </div>
-
-                <!-- Add/Edit User Modal -->
-                <div class="modal-overlay" id="userModal" style="display:none;">
-                    <div class="modal-card glass-panel">
-                        <div class="modal-header">
-                            <h3 id="userModalTitle">添加用户</h3>
-                            <button class="icon-btn" id="closeUserModal"><i class="ph ph-x"></i></button>
-                        </div>
-                        <form id="userForm">
-                            <input type="hidden" id="editUserId">
-                            <div class="form-field">
-                                <label for="newUsername">用户名</label>
-                                <input type="text" id="newUsername" required>
-                            </div>
-                            <div class="form-field">
-                                <label for="newPassword">密码</label>
-                                <input type="password" id="newPassword">
-                            </div>
-                            <div class="form-field">
-                                <label for="newDisplayName">显示名称</label>
-                                <input type="text" id="newDisplayName" required>
-                            </div>
-                            <div class="form-field">
-                                <label for="newRole">角色</label>
-                                <select id="newRole">
-                                    <option value="user">普通用户</option>
-                                    <option value="admin">管理员</option>
-                                </select>
-                            </div>
-                            <div class="modal-actions">
-                                <button type="button" class="btn btn-secondary" id="cancelUserModal">取消</button>
-                                <button type="submit" class="btn btn-primary">保存</button>
-                            </div>
-                        </form>
-                    </div>
-                </div>
+            <!-- View: User List (dynamically rendered, admin only) -->
+            <div class="view-content" id="viewUserList">
+                <div id="userListContent" class="view-scroll-area"></div>
             </div>
         </main>
     </div>
 
-    <script src="script.js?v=9"></script>
+    <script src="script.js?v=10"></script>
 </body>
 
 </html>

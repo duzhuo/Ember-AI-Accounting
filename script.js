@@ -18,8 +18,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const uploadBtn = document.getElementById('uploadBtn');
     const fileInput = document.getElementById('fileInput');
 
-    const initialState = document.getElementById('initialState');
-    const workspaceContent = document.getElementById('workspaceContent');
+    // Voucher workspace
+    const voucherWorkspaceContent = document.getElementById('voucherWorkspaceContent');
     const sourceDataContent = document.getElementById('sourceDataContent');
     const voucherRows = document.getElementById('voucherRows');
     const totalDebitEl = document.getElementById('totalDebit');
@@ -28,13 +28,67 @@ document.addEventListener('DOMContentLoaded', () => {
     const sourceBadge = document.getElementById('sourceBadge');
     const toggleSourceBtn = document.getElementById('toggleSourceData');
 
+    // View system
+    const viewHeader = document.getElementById('viewHeader');
+    const viewTitle = document.getElementById('viewTitle');
+    const viewBackBtn = document.getElementById('viewBackBtn');
+
     // ── App State ─────────────────────────────────────────────────────────────
     let isProcessing = false;
     let sessionId = null;
     let pendingFile = null;
     let currentVoucherId = null;
-    let rulesLoaded = false;
     let isPosted = false;
+    let currentView = 'empty';  // Track current view
+    let viewHistory = [];       // View history stack for back navigation
+
+    // ── View Management ──────────────────────────────────────────────────────
+
+    const VIEW_CONFIG = {
+        empty:       { title: '',              showHeader: false },
+        voucher:     { title: '凭证详情',       showHeader: true, icon: 'ph-receipt' },
+        voucher_list:{ title: '凭证记录',       showHeader: true, icon: 'ph-clock-counter-clockwise' },
+        rules:       { title: '凭证规则',       showHeader: true, icon: 'ph-list-dashes' },
+        user_list:   { title: '用户管理',       showHeader: true, icon: 'ph-users' },
+    };
+
+    function switchView(viewName, options = {}) {
+        const pushHistory = options.pushHistory !== false;
+        if (pushHistory && currentView !== viewName) {
+            viewHistory.push(currentView);
+        }
+        currentView = viewName;
+
+        // Hide all views
+        document.querySelectorAll('.view-content').forEach(el => el.classList.remove('active'));
+
+        // Show target view
+        const config = VIEW_CONFIG[viewName] || {};
+        const targetId = viewName === 'voucher_list' ? 'viewVoucherList'
+                       : viewName === 'user_list' ? 'viewUserList'
+                       : viewName === 'rules' ? 'viewRules'
+                       : viewName === 'voucher' ? 'viewVoucher'
+                       : 'viewEmpty';
+        const target = document.getElementById(targetId);
+        if (target) target.classList.add('active');
+
+        // Update header
+        if (config.showHeader) {
+            viewHeader.style.display = 'flex';
+            viewTitle.innerHTML = `<i class="ph ${config.icon || ''}"></i> ${config.title}`;
+        } else {
+            viewHeader.style.display = 'none';
+        }
+    }
+
+    viewBackBtn.addEventListener('click', () => {
+        const prevView = viewHistory.pop();
+        if (prevView) {
+            switchView(prevView, { pushHistory: false });
+        } else {
+            switchView('empty', { pushHistory: false });
+        }
+    });
 
     // ── API Helper ────────────────────────────────────────────────────────────
 
@@ -48,7 +102,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const resp = await fetch(url, { ...options, headers });
         if (resp.status === 401) {
-            // Token expired, redirect to login
             handleLogout();
             throw new Error('登录已过期，请重新登录');
         }
@@ -85,14 +138,6 @@ document.addEventListener('DOMContentLoaded', () => {
         loginOverlay.style.display = 'none';
         appContainer.style.display = 'grid';
         userDisplayName.textContent = currentUser.display_name || currentUser.username;
-
-        // Show admin-only tabs
-        const tabUsers = document.getElementById('tabUsers');
-        if (currentUser.role === 'admin') {
-            tabUsers.style.display = 'flex';
-        } else {
-            tabUsers.style.display = 'none';
-        }
     }
 
     loginForm.addEventListener('submit', async (e) => {
@@ -213,15 +258,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
         addMessage(data.reply, 'ai');
 
-        if (data.voucher) {
+        // Route to the correct view based on server response
+        const view = data.view;
+        if (view === 'voucher' && data.voucher) {
             currentVoucherId = data.voucher.voucher_id;
             activateWorkspace(data.voucher);
-        }
-
-        if (data.rules && data.rules.length > 0) {
-            rulesLoaded = true;
-            switchTab('rules');
+            switchView('voucher');
+        } else if (view === 'rules' && data.rules && data.rules.length > 0) {
             renderRules(data.rules);
+            switchView('rules');
+        } else if (view === 'voucher_list' && data.view_data) {
+            renderVoucherList(data.view_data.vouchers, data.view_data.total, data.view_data.status_filter);
+            switchView('voucher_list');
+        } else if (view === 'user_list' && data.view_data) {
+            renderUserList(data.view_data.users);
+            switchView('user_list');
         }
     }
 
@@ -249,6 +300,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const lastVoucher = data.vouchers[data.vouchers.length - 1];
             currentVoucherId = lastVoucher.voucher_id;
             activateWorkspace(lastVoucher);
+            switchView('voucher');
 
             if (data.vouchers.length > 1) {
                 addMessage(`共生成 ${data.vouchers.length} 张凭证，当前显示最后一张。`, 'ai');
@@ -289,10 +341,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const name = fileInfo.name || '';
         const ext = name.split('.').pop().toLowerCase();
         const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
-        const pdfExts = ['pdf'];
         let iconClass = 'ph-file-xls';
         if (imageExts.includes(ext)) iconClass = 'ph-image';
-        else if (pdfExts.includes(ext)) iconClass = 'ph-file-pdf';
+        else if (ext === 'pdf') iconClass = 'ph-file-pdf';
 
         sourceDataContent.innerHTML = `
             <div class="source-item">
@@ -307,12 +358,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function activateWorkspace(voucherData) {
-        switchTab('voucher');
-
-        if (initialState.style.display !== 'none') {
-            initialState.style.display = 'none';
-            workspaceContent.style.display = 'block';
-        }
+        voucherWorkspaceContent.style.display = 'block';
 
         isPosted = false;
         createTransactionBtn.innerHTML = '确认并记账 <i class="ph ph-check-circle"></i>';
@@ -440,57 +486,130 @@ document.addEventListener('DOMContentLoaded', () => {
 
     createTransactionBtn.addEventListener('click', confirmVoucher);
 
-    // ── Workspace Tabs ─────────────────────────────────────────────────────────
-
-    const tabBtns = document.querySelectorAll('.workspace-tab');
-    const tabContents = document.querySelectorAll('.tab-content');
-
-    function switchTab(tabName) {
-        tabBtns.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tabName));
-        tabContents.forEach(content => {
-            content.classList.toggle('active', content.id === `tabContent${tabName.charAt(0).toUpperCase() + tabName.slice(1)}`);
+    // Hint cards
+    document.querySelectorAll('.hint-card').forEach(card => {
+        card.addEventListener('click', () => {
+            const hint = card.dataset.hint;
+            if (hint) {
+                userInput.value = hint;
+                resizeTextarea();
+                sendMessage();
+            }
         });
+    });
 
-        if (tabName === 'rules' && !rulesLoaded) showRulesGuide();
-        if (tabName === 'history') loadVoucherHistory();
-        if (tabName === 'users') loadUsers();
+    // Toggle source data section
+    if (toggleSourceBtn) {
+        toggleSourceBtn.addEventListener('click', () => {
+            const isVisible = sourceDataContent.style.display !== 'none';
+            sourceDataContent.style.display = isVisible ? 'none' : 'block';
+            toggleSourceBtn.innerHTML = isVisible ? '<i class="ph ph-caret-down"></i>' : '<i class="ph ph-caret-up"></i>';
+        });
     }
 
-    tabBtns.forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
+    // ── Dynamic View Renderers ─────────────────────────────────────────────────
 
-    // ── Voucher Rules ──────────────────────────────────────────────────────────
+    // --- Voucher List View ---
+    function renderVoucherList(vouchers, total, statusFilter) {
+        const container = document.getElementById('voucherListContent');
+        const statusLabel = statusFilter === 'draft' ? '草稿' : statusFilter === 'posted' ? '已过账' : '全部';
 
-    function showRulesGuide() {
-        const list = document.getElementById('rulesList');
-        const loading = document.getElementById('rulesLoading');
-        const empty = document.getElementById('rulesEmpty');
-        if (loading) loading.style.display = 'none';
-        list.innerHTML = '';
-        list.style.display = 'none';
-        if (empty) {
-            empty.innerHTML = `
-                <i class="ph ph-book-open"></i>
-                <p>请在聊天框中询问凭证规则，例如：</p>
-                <ul style="text-align: left; margin: 12px 0; padding-left: 24px;">
-                    <li>「凭证规则是什么」— 查看可用的规则类型</li>
-                    <li>「我想看销售收入的凭证规则」— 查看具体规则</li>
-                </ul>
-            `;
-            empty.style.display = 'block';
+        let html = `
+            <div class="view-toolbar">
+                <div class="view-toolbar-info">
+                    <span class="view-count">${total} 条${statusLabel}凭证</span>
+                </div>
+                <div class="view-toolbar-actions">
+                    <select id="vlStatusFilter" class="history-select">
+                        <option value="" ${!statusFilter ? 'selected' : ''}>全部状态</option>
+                        <option value="draft" ${statusFilter === 'draft' ? 'selected' : ''}>草稿</option>
+                        <option value="posted" ${statusFilter === 'posted' ? 'selected' : ''}>已过账</option>
+                    </select>
+                    <button class="btn btn-secondary" id="vlRefreshBtn"><i class="ph ph-arrows-clockwise"></i> 刷新</button>
+                </div>
+            </div>
+        `;
+
+        if (!vouchers || vouchers.length === 0) {
+            html += `<div class="view-empty-state"><i class="ph ph-receipt"></i><p>暂无凭证记录</p></div>`;
+        } else {
+            html += `<div class="history-list">`;
+            vouchers.forEach(v => {
+                const statusBadge = v.status === 'posted'
+                    ? '<span class="status-badge status-posted">已过账</span>'
+                    : '<span class="status-badge status-draft">草稿</span>';
+                const createdAt = new Date(v.created_at).toLocaleString('zh-CN');
+                const postedInfo = v.posted_at
+                    ? `<span class="history-meta-item"><i class="ph ph-check-circle"></i> 过账: ${new Date(v.posted_at).toLocaleString('zh-CN')}</span>`
+                    : '';
+
+                html += `
+                    <div class="history-card">
+                        <div class="history-card-header">
+                            <div class="history-card-title">
+                                <span class="voucher-id-badge">${v.voucher_id}</span>
+                                ${statusBadge}
+                            </div>
+                            <span class="history-meta"><i class="ph ph-clock"></i> ${createdAt}</span>
+                        </div>
+                        <div class="history-card-body">
+                            <div class="history-meta-row">
+                                <span class="history-meta-item"><i class="ph ph-buildings"></i> ${v.company_code || '—'}</span>
+                                <span class="history-meta-item"><i class="ph ph-file-text"></i> ${v.document_type || '—'}</span>
+                                <span class="history-meta-item"><i class="ph ph-calendar"></i> ${v.document_date || '—'}</span>
+                                <span class="history-meta-item"><i class="ph ph-user"></i> ${v.user_display_name || '—'}</span>
+                            </div>
+                            <div class="history-meta-row">
+                                <span class="history-meta-item"><i class="ph ph-text-aa"></i> ${v.header_text || '—'}</span>
+                                ${postedInfo}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            html += `</div>`;
+        }
+
+        container.innerHTML = html;
+
+        // Bind events for the dynamically created filter/refresh
+        const statusFilterEl = document.getElementById('vlStatusFilter');
+        const refreshBtn = document.getElementById('vlRefreshBtn');
+        if (statusFilterEl) {
+            statusFilterEl.addEventListener('change', () => {
+                const status = statusFilterEl.value || null;
+                refreshVoucherList(status);
+            });
+        }
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', () => {
+                const status = statusFilterEl ? (statusFilterEl.value || null) : null;
+                refreshVoucherList(status);
+            });
         }
     }
 
-    function renderRules(rules) {
-        const list = document.getElementById('rulesList');
-        const loading = document.getElementById('rulesLoading');
-        const empty = document.getElementById('rulesEmpty');
-        list.innerHTML = '';
-        if (loading) loading.style.display = 'none';
-        if (empty) empty.style.display = 'none';
-        list.style.display = 'flex';
+    async function refreshVoucherList(status) {
+        const container = document.getElementById('voucherListContent');
+        container.innerHTML = `<div class="view-loading"><i class="ph ph-spinner ph-spin"></i> 加载中...</div>`;
 
+        try {
+            const params = new URLSearchParams({ limit: '50', offset: '0' });
+            if (status) params.set('status', status);
+            const resp = await apiFetch(`/api/vouchers?${params}`);
+            const data = await resp.json();
+            renderVoucherList(data.vouchers, data.total, status);
+        } catch (err) {
+            container.innerHTML = `<div class="view-empty-state"><i class="ph ph-warning-circle"></i><p>加载失败</p></div>`;
+        }
+    }
+
+    // --- Rules View ---
+    function renderRules(rules) {
+        const container = document.getElementById('rulesContent');
         const bizTypeLabels = { 'sales_revenue': '销售收入', 'expense': '费用报销', 'asset_purchase': '资产采购', 'salary': '工资薪酬', 'loan': '借款/还款' };
 
+        let html = '';
         rules.forEach(rule => {
             const bizLabel = bizTypeLabels[rule.business_type] || rule.business_type;
             const productLabel = rule.product_type === '*' ? '全部' : rule.product_type;
@@ -517,174 +636,156 @@ document.addEventListener('DOMContentLoaded', () => {
                 `;
             });
 
-            const card = document.createElement('div');
-            card.className = 'rule-card';
-            card.innerHTML = `
-                <div class="rule-card-header">
-                    <div class="rule-card-title">
-                        <span class="rule-code-badge">${rule.rule_code}</span>
-                        <h3>${bizLabel}</h3>
+            html += `
+                <div class="rule-card">
+                    <div class="rule-card-header">
+                        <div class="rule-card-title">
+                            <span class="rule-code-badge">${rule.rule_code}</span>
+                            <h3>${bizLabel}</h3>
+                        </div>
+                        <div class="rule-card-meta">
+                            <span class="meta-tag"><i class="ph ph-package"></i> 产品: ${productLabel}</span>
+                            <span class="meta-tag"><i class="ph ph-percent"></i> 税率: ${taxLabel}</span>
+                            <span class="meta-tag"><i class="ph ph-file-text"></i> 凭证类型: ${docLabel}</span>
+                        </div>
                     </div>
-                    <div class="rule-card-meta">
-                        <span class="meta-tag"><i class="ph ph-package"></i> 产品: ${productLabel}</span>
-                        <span class="meta-tag"><i class="ph ph-percent"></i> 税率: ${taxLabel}</span>
-                        <span class="meta-tag"><i class="ph ph-file-text"></i> 凭证类型: ${docLabel}</span>
-                    </div>
-                </div>
-                <table class="rule-lines-table">
-                    <thead><tr><th>行号</th><th>借/贷</th><th>科目代码</th><th>科目名称</th><th>金额取值</th><th>客户来源</th><th>税码规则</th><th>利润中心</th><th>成本中心</th><th>分配</th><th>摘要模板</th></tr></thead>
-                    <tbody>${linesHTML}</tbody>
-                </table>
-            `;
-            list.appendChild(card);
-        });
-    }
-
-    // ── Voucher History ────────────────────────────────────────────────────────
-
-    async function loadVoucherHistory() {
-        const loading = document.getElementById('historyLoading');
-        const empty = document.getElementById('historyEmpty');
-        const list = document.getElementById('historyList');
-        const statusFilter = document.getElementById('historyStatusFilter').value;
-
-        loading.style.display = 'block';
-        empty.style.display = 'none';
-        list.style.display = 'none';
-
-        try {
-            const params = new URLSearchParams({ limit: '50', offset: '0' });
-            if (statusFilter) params.set('status', statusFilter);
-
-            const resp = await apiFetch(`/api/vouchers?${params}`);
-            const data = await resp.json();
-
-            loading.style.display = 'none';
-
-            if (!data.vouchers || data.vouchers.length === 0) {
-                empty.style.display = 'block';
-                return;
-            }
-
-            list.style.display = 'flex';
-            renderVoucherHistory(data.vouchers);
-        } catch (err) {
-            loading.style.display = 'none';
-            empty.innerHTML = '<i class="ph ph-warning-circle"></i> 加载凭证记录失败';
-            empty.style.display = 'block';
-        }
-    }
-
-    function renderVoucherHistory(vouchers) {
-        const list = document.getElementById('historyList');
-        list.innerHTML = '';
-
-        vouchers.forEach(v => {
-            const statusBadge = v.status === 'posted'
-                ? '<span class="status-badge status-posted">已过账</span>'
-                : '<span class="status-badge status-draft">草稿</span>';
-
-            const createdAt = new Date(v.created_at).toLocaleString('zh-CN');
-            const postedInfo = v.posted_at
-                ? `<span class="history-meta-item"><i class="ph ph-check-circle"></i> 过账时间: ${new Date(v.posted_at).toLocaleString('zh-CN')}</span>`
-                : '';
-
-            const card = document.createElement('div');
-            card.className = 'history-card';
-            card.innerHTML = `
-                <div class="history-card-header">
-                    <div class="history-card-title">
-                        <span class="voucher-id-badge">${v.voucher_id}</span>
-                        ${statusBadge}
-                    </div>
-                    <span class="history-meta"><i class="ph ph-clock"></i> ${createdAt}</span>
-                </div>
-                <div class="history-card-body">
-                    <div class="history-meta-row">
-                        <span class="history-meta-item"><i class="ph ph-buildings"></i> ${v.company_code || '—'}</span>
-                        <span class="history-meta-item"><i class="ph ph-file-text"></i> ${v.document_type || '—'}</span>
-                        <span class="history-meta-item"><i class="ph ph-calendar"></i> ${v.document_date || '—'}</span>
-                        <span class="history-meta-item"><i class="ph ph-user"></i> ${v.user_display_name || '—'}</span>
-                    </div>
-                    <div class="history-meta-row">
-                        <span class="history-meta-item"><i class="ph ph-text-aa"></i> ${v.header_text || '—'}</span>
-                        ${postedInfo}
-                    </div>
+                    <table class="rule-lines-table">
+                        <thead><tr><th>行号</th><th>借/贷</th><th>科目代码</th><th>科目名称</th><th>金额取值</th><th>客户来源</th><th>税码规则</th><th>利润中心</th><th>成本中心</th><th>分配</th><th>摘要模板</th></tr></thead>
+                        <tbody>${linesHTML}</tbody>
+                    </table>
                 </div>
             `;
-            list.appendChild(card);
         });
+
+        container.innerHTML = html;
     }
 
-    document.getElementById('refreshHistoryBtn').addEventListener('click', loadVoucherHistory);
-    document.getElementById('historyStatusFilter').addEventListener('change', loadVoucherHistory);
+    // --- User List View ---
+    function renderUserList(users) {
+        const container = document.getElementById('userListContent');
 
-    // ── User Management ────────────────────────────────────────────────────────
-
-    async function loadUsers() {
-        if (!currentUser || currentUser.role !== 'admin') return;
-
-        try {
-            const resp = await apiFetch('/api/users');
-            const data = await resp.json();
-            renderUsers(data.users || []);
-        } catch (err) {
-            console.error('Failed to load users:', err);
-        }
-    }
-
-    function renderUsers(users) {
-        const tbody = document.getElementById('usersTableBody');
-        tbody.innerHTML = '';
-
+        let rowsHTML = '';
         users.forEach(u => {
             const roleLabel = u.role === 'admin' ? '<span class="role-badge role-admin">管理员</span>' : '<span class="role-badge role-user">普通用户</span>';
             const statusLabel = u.is_active ? '<span class="status-badge status-posted">启用</span>' : '<span class="status-badge status-draft">停用</span>';
             const createdAt = new Date(u.created_at).toLocaleString('zh-CN');
 
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${u.username}</td>
-                <td>${u.display_name}</td>
-                <td>${roleLabel}</td>
-                <td>${statusLabel}</td>
-                <td>${createdAt}</td>
-                <td class="users-actions">
-                    <button class="icon-btn-small edit-user-btn" data-id="${u.id}" data-username="${u.username}" data-display="${u.display_name}" data-role="${u.role}" title="编辑"><i class="ph ph-pencil"></i></button>
-                    <button class="icon-btn-small delete-user-btn" data-id="${u.id}" title="删除"><i class="ph ph-trash"></i></button>
-                </td>
+            rowsHTML += `
+                <tr>
+                    <td>${u.username}</td>
+                    <td>${u.display_name}</td>
+                    <td>${roleLabel}</td>
+                    <td>${statusLabel}</td>
+                    <td>${createdAt}</td>
+                    <td class="users-actions">
+                        <button class="icon-btn-small edit-user-btn" data-id="${u.id}" data-username="${u.username}" data-display="${u.display_name}" data-role="${u.role}" title="编辑"><i class="ph ph-pencil"></i></button>
+                        <button class="icon-btn-small delete-user-btn" data-id="${u.id}" title="删除"><i class="ph ph-trash"></i></button>
+                    </td>
+                </tr>
             `;
-            tbody.appendChild(tr);
         });
 
-        // Bind edit/delete buttons
-        tbody.querySelectorAll('.edit-user-btn').forEach(btn => {
+        container.innerHTML = `
+            <div class="view-toolbar">
+                <div class="view-toolbar-info">
+                    <span class="view-count">${users.length} 个用户</span>
+                </div>
+                <div class="view-toolbar-actions">
+                    <button class="btn btn-primary" id="addUserBtn"><i class="ph ph-plus"></i> 添加用户</button>
+                </div>
+            </div>
+            <table class="users-table">
+                <thead>
+                    <tr>
+                        <th>用户名</th>
+                        <th>显示名称</th>
+                        <th>角色</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>${rowsHTML}</tbody>
+            </table>
+        `;
+
+        // Bind events
+        container.querySelectorAll('.edit-user-btn').forEach(btn => {
             btn.addEventListener('click', () => openEditUserModal(btn.dataset));
         });
-        tbody.querySelectorAll('.delete-user-btn').forEach(btn => {
+        container.querySelectorAll('.delete-user-btn').forEach(btn => {
             btn.addEventListener('click', () => deleteUser(btn.dataset.id));
         });
+        document.getElementById('addUserBtn')?.addEventListener('click', openAddUserModal);
     }
 
-    const userModal = document.getElementById('userModal');
-    const userForm = document.getElementById('userForm');
-    const editUserIdInput = document.getElementById('editUserId');
+    // ── User Management Modal ──────────────────────────────────────────────────
 
-    document.getElementById('addUserBtn').addEventListener('click', () => {
+    function openAddUserModal() {
+        let modal = document.getElementById('userModal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'userModal';
+            modal.className = 'modal-overlay';
+            modal.style.display = 'none';
+            modal.innerHTML = `
+                <div class="modal-card glass-panel">
+                    <div class="modal-header">
+                        <h3 id="userModalTitle">添加用户</h3>
+                        <button class="icon-btn" id="closeUserModal"><i class="ph ph-x"></i></button>
+                    </div>
+                    <form id="userForm">
+                        <input type="hidden" id="editUserId">
+                        <div class="form-field">
+                            <label for="newUsername">用户名</label>
+                            <input type="text" id="newUsername" required>
+                        </div>
+                        <div class="form-field">
+                            <label for="newPassword">密码</label>
+                            <input type="password" id="newPassword">
+                        </div>
+                        <div class="form-field">
+                            <label for="newDisplayName">显示名称</label>
+                            <input type="text" id="newDisplayName" required>
+                        </div>
+                        <div class="form-field">
+                            <label for="newRole">角色</label>
+                            <select id="newRole">
+                                <option value="user">普通用户</option>
+                                <option value="admin">管理员</option>
+                            </select>
+                        </div>
+                        <div class="modal-actions">
+                            <button type="button" class="btn btn-secondary" id="cancelUserModal">取消</button>
+                            <button type="submit" class="btn btn-primary">保存</button>
+                        </div>
+                    </form>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            // Bind modal events
+            document.getElementById('closeUserModal').addEventListener('click', () => modal.style.display = 'none');
+            document.getElementById('cancelUserModal').addEventListener('click', () => modal.style.display = 'none');
+            document.getElementById('userForm').addEventListener('submit', handleUserFormSubmit);
+        }
+
         document.getElementById('userModalTitle').textContent = '添加用户';
-        editUserIdInput.value = '';
+        document.getElementById('editUserId').value = '';
         document.getElementById('newUsername').value = '';
         document.getElementById('newUsername').disabled = false;
         document.getElementById('newPassword').value = '';
         document.getElementById('newPassword').required = true;
+        document.getElementById('newPassword').placeholder = '';
         document.getElementById('newDisplayName').value = '';
         document.getElementById('newRole').value = 'user';
-        userModal.style.display = 'flex';
-    });
+        modal.style.display = 'flex';
+    }
 
     function openEditUserModal(dataset) {
+        openAddUserModal(); // Create/show modal first
         document.getElementById('userModalTitle').textContent = '编辑用户';
-        editUserIdInput.value = dataset.id;
+        document.getElementById('editUserId').value = dataset.id;
         document.getElementById('newUsername').value = dataset.username;
         document.getElementById('newUsername').disabled = true;
         document.getElementById('newPassword').value = '';
@@ -692,15 +793,11 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('newPassword').placeholder = '留空则不修改密码';
         document.getElementById('newDisplayName').value = dataset.display;
         document.getElementById('newRole').value = dataset.role;
-        userModal.style.display = 'flex';
     }
 
-    document.getElementById('closeUserModal').addEventListener('click', () => userModal.style.display = 'none');
-    document.getElementById('cancelUserModal').addEventListener('click', () => userModal.style.display = 'none');
-
-    userForm.addEventListener('submit', async (e) => {
+    async function handleUserFormSubmit(e) {
         e.preventDefault();
-        const editId = editUserIdInput.value;
+        const editId = document.getElementById('editUserId').value;
         const payload = {
             username: document.getElementById('newUsername').value.trim(),
             password: document.getElementById('newPassword').value,
@@ -710,45 +807,34 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             if (editId) {
-                // Update
-                await apiFetch(`/api/users/${editId}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(payload),
-                });
+                await apiFetch(`/api/users/${editId}`, { method: 'PUT', body: JSON.stringify(payload) });
             } else {
-                // Create
-                await apiFetch('/api/users', {
-                    method: 'POST',
-                    body: JSON.stringify(payload),
-                });
+                await apiFetch('/api/users', { method: 'POST', body: JSON.stringify(payload) });
             }
-            userModal.style.display = 'none';
-            loadUsers();
+            document.getElementById('userModal').style.display = 'none';
+            // Refresh user list view
+            const resp = await apiFetch('/api/users');
+            const data = await resp.json();
+            const users = (data.users || []).map(u => { u.pop?.('password_hash'); u.pop?.('password_salt'); return u; });
+            renderUserList(data.users || []);
         } catch (err) {
             console.error('Failed to save user:', err);
             alert('保存用户失败');
         }
-    });
+    }
 
     async function deleteUser(userId) {
         if (!confirm('确定要删除此用户吗？')) return;
         try {
             await apiFetch(`/api/users/${userId}`, { method: 'DELETE' });
-            loadUsers();
+            // Refresh user list
+            const resp = await apiFetch('/api/users');
+            const data = await resp.json();
+            renderUserList(data.users || []);
         } catch (err) {
             console.error('Failed to delete user:', err);
             alert('删除用户失败');
         }
-    }
-
-    // ── Toggle source data section ────────────────────────────────────────────
-
-    if (toggleSourceBtn) {
-        toggleSourceBtn.addEventListener('click', () => {
-            const isVisible = sourceDataContent.style.display !== 'none';
-            sourceDataContent.style.display = isVisible ? 'none' : 'block';
-            toggleSourceBtn.innerHTML = isVisible ? '<i class="ph ph-caret-down"></i>' : '<i class="ph ph-caret-up"></i>';
-        });
     }
 
     // ── Initialize ─────────────────────────────────────────────────────────────

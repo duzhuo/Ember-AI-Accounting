@@ -562,7 +562,140 @@ async def chat(payload: dict, request: Request):
             "session_id": session_id,
             "rules": rules_list,
             "rule_type": rule_type,
+            "view": "rules",
         })
+
+    # Handle voucher_query intent — show user's voucher records
+    if parse_result.get("intent") == "voucher_query":
+        status_filter = parse_result.get("status")
+        reply = parse_result.get("reply", "")
+
+        # Regular users see only their own; admins see all
+        user_id = None if user["role"] == "admin" else user["id"]
+        records = await list_voucher_records(user_id=user_id, status=status_filter, limit=50, offset=0)
+        total = await count_voucher_records(user_id=user_id, status=status_filter)
+
+        await add_audit_log(
+            action="voucher.query",
+            user_id=user["id"],
+            username=user["username"],
+            target_type="voucher",
+            details={"status_filter": status_filter, "result_count": len(records)},
+        )
+
+        status_label = {"draft": "草稿", "posted": "已过账"}.get(status_filter, "全部")
+        if not records:
+            if not reply:
+                reply = f"暂无{status_label}状态的凭证记录。"
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+            )
+            return JSONResponse({"reply": reply, "session_id": session_id})
+
+        if not reply:
+            reply = f"共找到 {total} 条{status_label}凭证记录："
+
+        await save_chat_message(
+            session_id=chat_session_id, user_id=user["id"],
+            role="assistant", content=reply, message_type="chat",
+            metadata={"voucher_count": len(records)},
+        )
+
+        return JSONResponse({
+            "reply": reply,
+            "session_id": session_id,
+            "view": "voucher_list",
+            "view_data": {"vouchers": records, "total": total, "status_filter": status_filter},
+        })
+
+    # Handle user_mgmt intent — admin creates user via conversation
+    if parse_result.get("intent") == "user_mgmt":
+        reply = parse_result.get("reply", "")
+
+        # Check admin permission
+        if user["role"] != "admin":
+            reply = "抱歉，只有管理员才能添加用户。"
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+            )
+            return JSONResponse({"reply": reply, "session_id": session_id})
+
+        action = parse_result.get("action", "create")
+        if action == "create":
+            new_username = parse_result.get("new_username", "").strip()
+            new_display_name = parse_result.get("new_display_name") or new_username
+            new_role = parse_result.get("new_role", "user")
+            new_password = parse_result.get("new_password")
+
+            if not new_username:
+                if not reply:
+                    reply = "请提供用户名。例如：「添加用户zhangsan，显示名称张三」"
+                await save_chat_message(
+                    session_id=chat_session_id, user_id=user["id"],
+                    role="assistant", content=reply, message_type="chat",
+                )
+                return JSONResponse({"reply": reply, "session_id": session_id})
+
+            # Generate default password if not provided
+            if not new_password:
+                import string
+                new_password = "User@" + secrets.token_hex(4)
+
+            try:
+                created = await create_user(new_username, new_password, new_display_name, new_role)
+            except Exception as exc:
+                if "UNIQUE constraint" in str(exc):
+                    reply = f"用户名「{new_username}」已存在，请使用其他用户名。"
+                else:
+                    reply = f"创建用户失败：{exc}"
+                await save_chat_message(
+                    session_id=chat_session_id, user_id=user["id"],
+                    role="assistant", content=reply, message_type="chat",
+                )
+                return JSONResponse({"reply": reply, "session_id": session_id})
+
+            await add_audit_log(
+                action="user.create",
+                user_id=user["id"],
+                username=user["username"],
+                target_type="user",
+                target_id=created["id"],
+                details={"new_username": new_username, "new_role": new_role},
+            )
+
+            role_label = "管理员" if new_role == "admin" else "普通用户"
+            if not reply:
+                reply = f"已成功创建用户：\n• 用户名：{new_username}\n• 显示名称：{new_display_name}\n• 角色：{role_label}\n• 密码：{new_password}\n\n请通知用户尽快修改密码。"
+
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+                metadata={"created_user": new_username},
+            )
+
+            # Also return updated user list
+            users = await list_users()
+            for u in users:
+                u.pop("password_hash", None)
+                u.pop("password_salt", None)
+
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+                "view": "user_list",
+                "view_data": {"users": users},
+            })
+
+        # Default reply for unknown user_mgmt action
+        if not reply:
+            reply = "请告诉我您要如何管理用户，例如「添加用户zhangsan」。"
+        await save_chat_message(
+            session_id=chat_session_id, user_id=user["id"],
+            role="assistant", content=reply, message_type="chat",
+        )
+        return JSONResponse({"reply": reply, "session_id": session_id})
 
     business_type = parse_result["business_type"]
     txn = parse_result["transaction"]
@@ -645,6 +778,7 @@ async def chat(payload: dict, request: Request):
         "reply": reply,
         "session_id": session_id,
         "voucher": voucher_front,
+        "view": "voucher",
     })
 
 
@@ -1102,6 +1236,8 @@ NL_PARSE_SYSTEM_PROMPT = """\
 
 - business：用户在描述一笔具体的财务/业务交易（如「卖软件给XX公司」「请客户吃饭花了560元」「采购了一台服务器」）
 - rule_query：用户在询问凭证规则/记账规则（如「凭证规则是什么」「我想看销售收入凭证怎么记」「费用报销怎么入账」「凭证规则」）
+- voucher_query：用户想查看已生成的凭证记录（如「查看我的凭证」「我生成的凭证有哪些」「凭证记录」「看看凭证」）
+- user_mgmt：管理员想通过对话添加或管理用户（如「添加一个用户」「新建用户张三」「添加普通用户李四密码123456」）
 - chat：用户在提问、闲聊、求助或与系统对话（如「你好」「你能做什么？」「什么是增值税？」）
 - unknown：无法判断
 
@@ -1114,6 +1250,22 @@ NL_PARSE_SYSTEM_PROMPT = """\
 - 如果用户只是笼统地问（如「凭证规则是什么」「我想看规则」），则 rule_type 为 null
 
 rule_type 的可选值：sales_revenue / expense / asset_purchase / salary / loan
+
+## voucher_query 意图的处理
+
+当用户查看凭证记录时：
+- 如果用户指定了状态筛选（如「查看已过账的凭证」「草稿状态的凭证」），则提取 status
+- 如果用户没有指定状态，status 为 null 表示查看全部
+
+status 的可选值：draft / posted / null
+
+## user_mgmt 意图的处理
+
+当管理员想添加用户时，提取以下信息：
+- new_username：新用户的登录名
+- new_display_name：新用户的显示名称（如未提供则与 username 相同）
+- new_role：角色，user（普通用户）或 admin（管理员），默认 user
+- new_password：密码（如未提供则为 null，系统将生成默认密码）
 
 ## 业务类型判断规则（仅 intent=business 时需要）
 
@@ -1149,6 +1301,28 @@ rule_type 的可选值：sales_revenue / expense / asset_purchase / salary / loa
 ```
 如果用户明确指定了业务类型，rule_type 填对应的值，reply 中确认并说明即将展示该类型的规则。
 如果用户没有指定具体类型，rule_type 填 null，reply 中列出可查看规则的凭证类型，引导用户选择。
+
+### intent=voucher_query 时：
+```json
+{
+  "intent": "voucher_query",
+  "status": "draft / posted / null",
+  "reply": "对用户查看凭证的确认回复"
+}
+```
+
+### intent=user_mgmt 时：
+```json
+{
+  "intent": "user_mgmt",
+  "action": "create",
+  "new_username": "登录名",
+  "new_display_name": "显示名称 或 null",
+  "new_role": "user / admin",
+  "new_password": "密码 或 null",
+  "reply": "对管理员操作的确认或引导回复"
+}
+```
 
 ### intent=business 时：
 ```json
@@ -1229,6 +1403,28 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
             return {
                 "intent": "rule_query",
                 "rule_type": data.get("rule_type"),
+                "reply": data.get("reply", ""),
+                "business_type": None,
+                "transaction": None,
+            }
+
+        if intent == "voucher_query":
+            return {
+                "intent": "voucher_query",
+                "status": data.get("status"),
+                "reply": data.get("reply", ""),
+                "business_type": None,
+                "transaction": None,
+            }
+
+        if intent == "user_mgmt":
+            return {
+                "intent": "user_mgmt",
+                "action": data.get("action", "create"),
+                "new_username": data.get("new_username"),
+                "new_display_name": data.get("new_display_name"),
+                "new_role": data.get("new_role", "user"),
+                "new_password": data.get("new_password"),
                 "reply": data.get("reply", ""),
                 "business_type": None,
                 "transaction": None,
