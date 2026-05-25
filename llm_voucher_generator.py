@@ -21,13 +21,10 @@ logger = logging.getLogger(__name__)
 
 MODEL_BASE_URL = os.environ.get(
     "PMDE_BASE_URL",
-    "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "https://api.xiaomimimo.com/v1",
 )
-MODEL_API_KEY = os.environ.get(
-    "PMDE_API_KEY",
-    "4fea2171-9079-434e-bdf5-d98a00db9363",
-)
-MODEL_NAME = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
+MODEL_API_KEY = os.environ.get("MIMO_API_KEY", "")
+MODEL_NAME = os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro")
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
@@ -104,7 +101,8 @@ class LLMVoucherGenerator:
     def __init__(self) -> None:
         self._client = AsyncOpenAI(
             base_url=MODEL_BASE_URL,
-            api_key=MODEL_API_KEY,
+            api_key="placeholder",  # MiMo uses api-key header, not Bearer
+            default_headers={"api-key": MODEL_API_KEY} if MODEL_API_KEY else {},
         )
 
     async def generate(self, txn: SalesTransaction) -> Voucher:

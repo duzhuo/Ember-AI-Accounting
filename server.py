@@ -1382,12 +1382,10 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
     import os
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
+        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
     )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
-    model_name = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
+    api_key = os.environ.get("MIMO_API_KEY", "")
+    model_name = os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro")
 
     today = date.today().strftime("%Y-%m-%d")
     user_prompt = (
@@ -1396,7 +1394,11 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
     )
 
     try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key="placeholder",
+            default_headers={"api-key": api_key} if api_key else {},
+        )
         completion = await client.chat.completions.create(
             model=model_name,
             messages=[
@@ -1496,14 +1498,12 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
     import base64
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
+        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
     )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
+    api_key = os.environ.get("MIMO_API_KEY", "")
     model_name = os.environ.get(
         "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
+        os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro"),
     )
 
     today = date.today().strftime("%Y-%m-%d")
@@ -1523,7 +1523,11 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
         return None
 
     try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key="placeholder",
+            default_headers={"api-key": api_key} if api_key else {},
+        )
         completion = await client.chat.completions.create(
             model=model_name,
             messages=[
@@ -1609,14 +1613,12 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
         return None
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
+        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
     )
-    api_key = os.environ.get(
-        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
-    )
+    api_key = os.environ.get("MIMO_API_KEY", "")
     model_name = os.environ.get(
         "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
+        os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro"),
     )
 
     today = date.today().strftime("%Y-%m-%d")
@@ -1634,7 +1636,11 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
         page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
 
     try:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key="placeholder",
+            default_headers={"api-key": api_key} if api_key else {},
+        )
         completion = await client.chat.completions.create(
             model=model_name,
             messages=[
