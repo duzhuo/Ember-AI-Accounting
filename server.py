@@ -29,22 +29,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from prompts import NL_PARSE_SYSTEM_PROMPT, IMAGE_PARSE_SYSTEM_PROMPT
+
 from database import (
     add_audit_log,
     authenticate_user,
+    create_rule,
     create_session_token,
     create_user,
+    delete_rule as db_delete_rule,
     delete_session,
     delete_user,
+    get_rule,
     get_user_by_token,
     init_db,
     list_audit_logs,
     list_chat_messages,
+    get_voucher_record,
+    list_rules,
     list_users,
     list_voucher_records,
     mark_voucher_posted,
+    migrate_rules_from_excel,
     save_chat_message,
     save_voucher_record,
+    update_rule as db_update_rule,
     update_user,
     count_voucher_records,
 )
@@ -52,7 +61,7 @@ from excel_loader import load_sales_transactions
 from llm_voucher_generator import LLMVoucherGenerator
 from sap_exporter import export_sap_csv
 from voucher_models import Voucher, VoucherLine
-from voucher_rules import build_sales_revenue_voucher, load_voucher_rule_lines
+from voucher_rules import build_sales_revenue_voucher, load_voucher_rule_lines, VoucherRuleLine
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +88,16 @@ POSTED_CSV = PROJECT_ROOT / "data" / "output" / "posted_vouchers.csv"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Constants ───────────────────────────────────────────────────────────────
+
+BIZ_TYPE_LABELS = {
+    "sales_revenue": "销售收入",
+    "expense": "费用报销",
+    "asset_purchase": "资产采购",
+    "salary": "工资薪酬",
+    "loan": "借款/还款",
+}
 POSTED_CSV.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Globals ──────────────────────────────────────────────────────────────────
@@ -268,6 +287,9 @@ def _voucher_to_front(voucher: Voucher) -> dict:
 async def startup():
     await init_db()
     logger.info("Database initialized")
+    migrated = await migrate_rules_from_excel()
+    if migrated:
+        logger.info("Migrated %d rules from Excel to database", migrated)
 
 
 # ── API: Auth ─────────────────────────────────────────────────────────────────
@@ -421,6 +443,45 @@ async def api_delete_user(user_id: str, request: Request):
     return JSONResponse({"status": "ok"})
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _format_rules_for_frontend(rules: list[dict]) -> list[dict]:
+    """Convert database rule dicts to the frontend display format."""
+    result = []
+    for rule in rules:
+        formatted = {
+            "rule_code": rule["rule_code"],
+            "business_type": rule["business_type"],
+            "product_type": rule["product_type"],
+            "tax_rate": rule["tax_rate"],
+            "document_type": rule["document_type"],
+            "lines": [],
+        }
+        for line in rule.get("lines", []):
+            formatted["lines"].append({
+                "line_no": line["line_no"],
+                "debit_credit": line["debit_credit"],
+                "debit_credit_display": "借" if line["debit_credit"] == "S" else "贷",
+                "account_code": line["account_code"],
+                "account_name": line["account_name"],
+                "amount_field": line["amount_field"],
+                "amount_field_display": {
+                    "total_amount": "价税合计",
+                    "tax_excluded_amount": "不含税金额",
+                    "tax_amount": "税额",
+                }.get(line["amount_field"], line["amount_field"]),
+                "customer_source": line.get("customer_source", ""),
+                "tax_code_rule": line.get("tax_code_rule", ""),
+                "profit_center_source": line.get("profit_center_source", ""),
+                "cost_center_source": line.get("cost_center_source", ""),
+                "assignment_source": line.get("assignment_source", ""),
+                "text_template": line.get("text_template", ""),
+            })
+        result.append(formatted)
+    return result
+
+
 # ── API: Chat ────────────────────────────────────────────────────────────────
 
 
@@ -436,8 +497,8 @@ async def chat(payload: dict, request: Request):
         logger.info("Session %s expired (inactive > %dh), creating new session", session_id, SESSION_TIMEOUT_HOURS)
         session_id = None
 
-    chat_session_id = session_id or str(uuid.uuid4())
     session_id, session = _get_session(session_id)
+    chat_session_id = session_id
 
     if not message:
         return JSONResponse({
@@ -459,7 +520,45 @@ async def chat(payload: dict, request: Request):
     # DeepSeek V4 Pro supports 1M context; use 200 messages (100 turns)
     recent_history = await list_chat_messages(session_id=chat_session_id, limit=200)
     history_for_llm = [{"role": m["role"], "content": m["content"]} for m in recent_history]
-    parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
+
+    # ── Pending action check: if the last assistant message had a pending action,
+    #    try to continue that flow instead of re-classifying via LLM. ──
+    parse_result = None
+    msg_lower_for_pending = message.lower()
+    biz_type_map = {
+        "销售收入": "sales_revenue", "销售": "sales_revenue",
+        "费用报销": "expense", "费用": "expense", "报销": "expense",
+        "资产采购": "asset_purchase", "资产": "asset_purchase", "采购": "asset_purchase",
+        "工资薪酬": "salary", "工资": "salary", "薪酬": "salary",
+        "借款": "loan", "还款": "loan", "贷款": "loan",
+    }
+
+    if recent_history:
+        last_msg = recent_history[0]  # most recent message (desc order)
+        if last_msg["role"] == "assistant":
+            last_meta = last_msg.get("metadata") or {}
+            pending = last_meta.get("pending_action")
+            if pending in ("rule_mgmt", "rule_query"):
+                pending_type = last_meta.get("pending_action_type", "create")
+                # Try to extract business type from user's reply
+                detected_type = None
+                for kw, biz_type in biz_type_map.items():
+                    if kw in msg_lower_for_pending:
+                        detected_type = biz_type
+                        break
+                if detected_type:
+                    parse_result = {
+                        "intent": pending,
+                        "action": pending_type if pending == "rule_mgmt" else None,
+                        "rule_type": detected_type,
+                        "reply": "",
+                        "business_type": None,
+                        "transaction": None,
+                    }
+                    logger.info("Pending action: continuing %s (type=%s) for '%s'", pending, detected_type, message[:60])
+
+    if parse_result is None:
+        parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
@@ -478,23 +577,14 @@ async def chat(payload: dict, request: Request):
         rule_mgmt_keywords = ["新增规则", "添加规则", "创建规则", "建立规则", "修改规则", "更新规则", "删除规则", "去掉规则",
                               "新增凭证规则", "添加凭证规则", "创建凭证规则"]
         rule_mgmt_action_keywords = ["新增", "添加", "创建", "建立", "修改", "更新", "删除", "去掉"]
-        # Business type keywords for rule_query context fallback
-        biz_type_map = {
-            "销售收入": "sales_revenue", "销售": "sales_revenue",
-            "费用报销": "expense", "费用": "expense", "报销": "expense",
-            "资产采购": "asset_purchase", "资产": "asset_purchase", "采购": "asset_purchase",
-            "工资薪酬": "salary", "工资": "salary", "薪酬": "salary",
-            "借款": "loan", "还款": "loan", "贷款": "loan",
-        }
 
-        # Check if previous assistant message was a rule_query prompt
-        last_assistant_is_rule_prompt = False
-        if history_for_llm:
-            for m in reversed(history_for_llm):
-                if m["role"] == "assistant":
-                    if "凭证规则" in m["content"] or "凭证类型" in m["content"] or "哪种类型" in m["content"]:
-                        last_assistant_is_rule_prompt = True
-                    break
+        # Check pending action from last assistant message metadata
+        pending_action_from_history = None
+        if recent_history:
+            last_msg = recent_history[0]
+            if last_msg["role"] == "assistant":
+                last_meta = last_msg.get("metadata") or {}
+                pending_action_from_history = last_meta.get("pending_action")
 
         if any(kw in msg_lower for kw in voucher_keywords):
             # Override intent to voucher_query
@@ -508,7 +598,6 @@ async def chat(payload: dict, request: Request):
 
         elif any(kw in msg_lower for kw in rule_mgmt_keywords):
             # Override intent to rule_mgmt
-            # Try to detect rule_type from the message
             detected_type = None
             for kw, biz_type in biz_type_map.items():
                 if kw in msg_lower:
@@ -527,16 +616,17 @@ async def chat(payload: dict, request: Request):
             parse_result = {"intent": "rule_mgmt", "action": "create", "rule_type": detected_type, "reply": "", "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → rule_mgmt (type=%s) for '%s'", detected_type, message[:60])
 
-        elif last_assistant_is_rule_prompt:
-            # Context: previous message asked which rule type → this message is a selection
+        elif pending_action_from_history == "rule_mgmt":
+            # Context: previous message was a rule_mgmt prompt → this is a type selection
+            pending_type = (recent_history[0].get("metadata") or {}).get("pending_action_type", "create")
             matched_type = None
             for kw, biz_type in biz_type_map.items():
                 if kw in msg_lower:
                     matched_type = biz_type
                     break
             if matched_type:
-                parse_result = {"intent": "rule_query", "rule_type": matched_type, "reply": "", "business_type": None, "transaction": None}
-                logger.info("Context fallback: chat → rule_query (type=%s) for '%s'", matched_type, message[:60])
+                parse_result = {"intent": "rule_mgmt", "action": pending_type, "rule_type": matched_type, "reply": "", "business_type": None, "transaction": None}
+                logger.info("Context fallback: chat → rule_mgmt (action=%s, type=%s) for '%s'", pending_type, matched_type, message[:60])
 
         if parse_result.get("intent") == "chat":
             # Still chat after all fallbacks
@@ -579,15 +669,17 @@ async def chat(payload: dict, request: Request):
                 role="assistant",
                 content=reply,
                 message_type="chat",
+                metadata={"pending_action": "rule_query"},
             )
             return JSONResponse({
                 "reply": reply,
                 "session_id": session_id,
             })
 
-        # User specified a type — load and return the matching rules
+        # User specified a type — load from database and return matching rules
         try:
-            rule_lines = load_voucher_rule_lines()
+            rules_list = await list_rules(business_type=rule_type)
+            rules_list = _format_rules_for_frontend(rules_list)
         except Exception as exc:
             logger.error("Failed to load voucher rules: %s", exc)
             return JSONResponse({
@@ -595,48 +687,7 @@ async def chat(payload: dict, request: Request):
                 "session_id": session_id,
             })
 
-        filtered_rules: dict[str, list[dict]] = {}
-        for rl in rule_lines:
-            if rl.business_type != rule_type:
-                continue
-            if rl.rule_code not in filtered_rules:
-                filtered_rules[rl.rule_code] = {
-                    "rule_code": rl.rule_code,
-                    "business_type": rl.business_type,
-                    "product_type": rl.product_type,
-                    "tax_rate": rl.tax_rate,
-                    "document_type": rl.document_type,
-                    "lines": [],
-                }
-            filtered_rules[rl.rule_code]["lines"].append({
-                "line_no": rl.line_no,
-                "debit_credit": rl.debit_credit,
-                "debit_credit_display": "借" if rl.debit_credit == "S" else "贷",
-                "account_code": rl.account_code,
-                "account_name": rl.account_name,
-                "amount_field": rl.amount_field,
-                "amount_field_display": {
-                    "total_amount": "价税合计",
-                    "tax_excluded_amount": "不含税金额",
-                    "tax_amount": "税额",
-                }.get(rl.amount_field, rl.amount_field),
-                "customer_source": rl.customer_source,
-                "tax_code_rule": rl.tax_code_rule,
-                "profit_center_source": rl.profit_center_source,
-                "cost_center_source": rl.cost_center_source,
-                "assignment_source": rl.assignment_source,
-                "text_template": rl.text_template,
-            })
-
-        rules_list = list(filtered_rules.values())
-        biz_type_labels = {
-            "sales_revenue": "销售收入",
-            "expense": "费用报销",
-            "asset_purchase": "资产采购",
-            "salary": "工资薪酬",
-            "loan": "借款/还款",
-        }
-        biz_label = biz_type_labels.get(rule_type, rule_type)
+        biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
 
         if not rules_list:
             if not reply:
@@ -669,43 +720,32 @@ async def chat(payload: dict, request: Request):
         rule_type = parse_result.get("rule_type")
         reply = parse_result.get("reply", "")
 
-        biz_type_labels = {
-            "sales_revenue": "销售收入",
-            "expense": "费用报销",
-            "asset_purchase": "资产采购",
-            "salary": "工资薪酬",
-            "loan": "借款/还款",
-        }
-
         if not rule_type:
             if not reply:
                 reply = "请告诉我要管理哪种业务类型的规则？可选类型：\n• 销售收入\n• 费用报销\n• 资产采购\n• 工资薪酬\n• 借款/还款"
             await save_chat_message(
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
+                metadata={"pending_action": "rule_mgmt", "pending_action_type": action},
             )
             return JSONResponse({"reply": reply, "session_id": session_id})
 
-        biz_label = biz_type_labels.get(rule_type, rule_type)
+        biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
+
+        # Admin permission check for all write operations
+        if user["role"] != "admin":
+            reply = f"抱歉，只有管理员才能管理凭证规则。"
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+            )
+            return JSONResponse({"reply": reply, "session_id": session_id})
 
         if action == "create":
-            # Check admin permission
-            if user["role"] != "admin":
-                reply = f"抱歉，只有管理员才能创建凭证规则。"
-                await save_chat_message(
-                    session_id=chat_session_id, user_id=user["id"],
-                    role="assistant", content=reply, message_type="chat",
-                )
-                return JSONResponse({"reply": reply, "session_id": session_id})
-
             if not reply:
                 reply = (
                     f"好的，我来帮你创建「{biz_label}」类型的凭证规则。\n\n"
-                    "请提供以下信息：\n"
-                    "1. **产品类型**：software / service / saas / goods / *（全部）\n"
-                    "2. **税率**：0.13 / 0.06 / 0.00 / *（全部）\n"
-                    "3. **记账分录**：每行的借贷方向、科目代码、科目名称、金额取值字段\n\n"
-                    "示例：「产品类型 service，税率 0.06，借方 6001 主营业务收入 不含税金额，贷方 2221.01 应交增值税 税额」"
+                    "请在右侧弹出的表单中填写规则信息，或直接告诉我规则详情。"
                 )
 
             await save_chat_message(
@@ -729,14 +769,47 @@ async def chat(payload: dict, request: Request):
                 "rule_mgmt": {"action": "create", "rule_type": rule_type},
             })
 
-        # update / delete — placeholder
-        if not reply:
-            reply = f"「{biz_label}」规则的{action}功能正在开发中，敬请期待。"
-        await save_chat_message(
-            session_id=chat_session_id, user_id=user["id"],
-            role="assistant", content=reply, message_type="chat",
-        )
-        return JSONResponse({"reply": reply, "session_id": session_id})
+        if action in ("update", "delete"):
+            try:
+                rules_list = await list_rules(business_type=rule_type)
+                rules_list = _format_rules_for_frontend(rules_list)
+            except Exception as exc:
+                logger.error("Failed to load rules: %s", exc)
+                return JSONResponse({"reply": "加载规则失败，请重试。", "session_id": session_id})
+
+            if not rules_list:
+                reply = f"暂无「{biz_label}」类型的规则可供{action}。"
+                await save_chat_message(
+                    session_id=chat_session_id, user_id=user["id"],
+                    role="assistant", content=reply, message_type="chat",
+                )
+                return JSONResponse({"reply": reply, "session_id": session_id})
+
+            if not reply:
+                verb = "修改" if action == "update" else "删除"
+                reply = f"请选择要{verb}的「{biz_label}」规则："
+
+            await save_chat_message(
+                session_id=chat_session_id, user_id=user["id"],
+                role="assistant", content=reply, message_type="chat",
+                metadata={"action": f"rule_mgmt_{action}", "rule_type": rule_type},
+            )
+
+            await add_audit_log(
+                action=f"rule.{action}_start",
+                user_id=user["id"],
+                username=user["username"],
+                target_type="rule",
+                details={"rule_type": rule_type},
+            )
+
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+                "view": "rules",
+                "rules": rules_list,
+                "rule_mgmt": {"action": action, "rule_type": rule_type},
+            })
 
     # Handle voucher_query intent — show user's voucher records
     if parse_result.get("intent") == "voucher_query":
@@ -963,54 +1036,6 @@ async def chat(payload: dict, request: Request):
 # ── API: File Upload ─────────────────────────────────────────────────────────
 
 
-IMAGE_PARSE_SYSTEM_PROMPT = """\
-你是一个财务单据识别助手。用户会上传一张发票或财务单据的图片，你需要从中识别并提取结构化的交易数据。
-
-## 业务类型判断规则
-
-- sales_revenue：销售发票（如增值税专用发票、普通发票，属于销售方开出的）
-- expense：费用报销单据（如餐饮发票、差旅发票、办公用品发票，属于购买方收到的）
-- asset_purchase：采购固定资产的发票
-- salary：工资薪酬相关
-- loan：借款或还款
-- other：其他无法归类
-
-## 目前系统仅支持处理的业务类型
-- sales_revenue（销售收入）
-
-如果 business_type 不是 sales_revenue，只需输出 business_type 字段即可，其他字段可以省略。
-
-请严格按照以下JSON格式输出，不要包含任何其他文字：
-
-```json
-{
-  "business_type": "sales_revenue / expense / asset_purchase / salary / loan / other",
-  "transaction_id": "自动生成，格式 SO-YYYYMMDD-XXX",
-  "company_code": "从发票中提取，若无则用 1000",
-  "document_date": "开票日期，YYYY-MM-DD",
-  "posting_date": "与document_date相同",
-  "customer_code": "购买方纳税人识别号或编码，若无则用 C99999",
-  "customer_name": "购买方名称",
-  "product_type": "software / service / saas / goods 之一，根据货物或应税劳务名称判断",
-  "contract_no": "若无则生成 CTR-YYYY-XX-XXX",
-  "invoice_no": "发票号码",
-  "currency": "CNY",
-  "tax_rate": "从税率栏提取，如 0.13 / 0.06 / 0.00",
-  "tax_excluded_amount": "不含税金额，精确到分",
-  "tax_amount": "税额，精确到分",
-  "total_amount": "价税合计，精确到分",
-  "profit_center": "若无则用 PC-DEFAULT",
-  "cost_center": "若无则用 CC-DEFAULT"
-}
-```
-
-如果图片模糊无法识别，或不是财务单据，请输出：
-```json
-{"business_type": "other"}
-```
-"""
-
-
 @app.post("/api/upload")
 async def upload_file(
     request: Request,
@@ -1189,29 +1214,39 @@ async def upload_file(
 
 @app.post("/api/confirm")
 async def confirm_voucher(payload: dict, request: Request):
-    """Mark a voucher as posted: append to posted_vouchers.csv + update session + audit."""
+    """Mark a voucher as posted: append to posted_vouchers.csv + update DB + audit."""
     user = await _require_auth(request)
     session_id = payload.get("session_id")
     voucher_id = payload.get("voucher_id")
     session_id, session = _get_session(session_id)
 
+    # Try session first, then fall back to DB
     voucher = None
     for v in session.get("vouchers", []):
         if v.voucher_id == voucher_id:
             voucher = v
             break
 
+    db_record = None
     if not voucher:
-        return JSONResponse({"status": "not_found", "message": f"凭证 {voucher_id} 不存在"})
+        db_record = await get_voucher_record(voucher_id)
+        if not db_record:
+            return JSONResponse({"status": "not_found", "message": f"凭证 {voucher_id} 不存在"})
+        if db_record.get("status") == "posted":
+            return JSONResponse({"status": "already_posted", "message": f"凭证 {voucher_id} 已经过账"})
 
     # Append to posted_vouchers.csv
-    _append_posted_csv(voucher)
+    if voucher:
+        _append_posted_csv(voucher)
+    else:
+        _append_posted_csv_from_record(db_record)
 
-    # Update session: mark voucher as posted
-    session["posted_voucher_ids"] = session.get("posted_voucher_ids", [])
-    if voucher_id not in session["posted_voucher_ids"]:
-        session["posted_voucher_ids"].append(voucher_id)
-    _save_session(session_id, session)
+    # Update session if voucher was session-loaded
+    if voucher:
+        session["posted_voucher_ids"] = session.get("posted_voucher_ids", [])
+        if voucher_id not in session["posted_voucher_ids"]:
+            session["posted_voucher_ids"].append(voucher_id)
+        _save_session(session_id, session)
 
     # Update database record
     await mark_voucher_posted(voucher_id, user["id"])
@@ -1279,56 +1314,171 @@ def _append_posted_csv(voucher: Voucher) -> None:
             })
 
 
+def _append_posted_csv_from_record(record: dict) -> None:
+    """Append a DB voucher record's lines to posted_vouchers.csv."""
+    import csv
+    from sap_exporter import SAP_COLUMNS
+
+    voucher_data = json.loads(record.get("voucher_data") or "{}")
+    rows = voucher_data.get("rows", [])
+
+    write_header = not POSTED_CSV.exists() or POSTED_CSV.stat().st_size == 0
+
+    with POSTED_CSV.open("a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=SAP_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "BUKRS": record.get("company_code", ""),
+                "BLART": record.get("document_type", ""),
+                "BLDAT": record.get("document_date", ""),
+                "BUDAT": record.get("posting_date", ""),
+                "XBLNR": record.get("reference", ""),
+                "BKTXT": record.get("header_text", ""),
+                "BUZEI": row.get("line_no", ""),
+                "SHKZG": row.get("debit_credit", ""),
+                "HKONT": row.get("account_code", ""),
+                "ACCOUNT_NAME": row.get("account_name", ""),
+                "WRBTR": row.get("debit", 0) or row.get("credit", 0),
+                "WAERS": row.get("currency", "CNY"),
+                "KUNNR": row.get("customer_code", ""),
+                "CUSTOMER_NAME": row.get("customer_name", ""),
+                "MWSKZ": row.get("tax_code", ""),
+                "PRCTR": row.get("profit_center", ""),
+                "KOSTL": row.get("cost_center", ""),
+                "ZUONR": row.get("assignment", ""),
+                "SGTXT": row.get("text", ""),
+            })
+
+
 # ── API: Voucher Rules ───────────────────────────────────────────────────────
 
 
 @app.get("/api/rules")
-async def get_voucher_rules(request: Request):
+async def get_voucher_rules(request: Request, business_type: str | None = None):
     """Return the current voucher rule configuration as JSON."""
     user = await _require_auth(request)
 
     try:
-        rule_lines = load_voucher_rule_lines()
+        rules = await list_rules(business_type=business_type)
+        rules = _format_rules_for_frontend(rules)
     except Exception as exc:
         logger.error("Failed to load voucher rules: %s", exc)
         return JSONResponse({"error": str(exc)}, status_code=500)
 
-    rules_grouped: dict[str, list[dict]] = {}
-    for rl in rule_lines:
-        if rl.rule_code not in rules_grouped:
-            rules_grouped[rl.rule_code] = {
-                "rule_code": rl.rule_code,
-                "business_type": rl.business_type,
-                "product_type": rl.product_type,
-                "tax_rate": rl.tax_rate,
-                "document_type": rl.document_type,
-                "lines": [],
-            }
-        rules_grouped[rl.rule_code]["lines"].append({
-            "line_no": rl.line_no,
-            "debit_credit": rl.debit_credit,
-            "debit_credit_display": "借" if rl.debit_credit == "S" else "贷",
-            "account_code": rl.account_code,
-            "account_name": rl.account_name,
-            "amount_field": rl.amount_field,
-            "amount_field_display": {
-                "total_amount": "价税合计",
-                "tax_excluded_amount": "不含税金额",
-                "tax_amount": "税额",
-            }.get(rl.amount_field, rl.amount_field),
-            "customer_source": rl.customer_source,
-            "tax_code_rule": rl.tax_code_rule,
-            "profit_center_source": rl.profit_center_source,
-            "cost_center_source": rl.cost_center_source,
-            "assignment_source": rl.assignment_source,
-            "text_template": rl.text_template,
-        })
-
+    total_lines = sum(len(r.get("lines", [])) for r in rules)
     return JSONResponse({
-        "rules": list(rules_grouped.values()),
-        "total_rules": len(rules_grouped),
-        "total_lines": len(rule_lines),
+        "rules": rules,
+        "total_rules": len(rules),
+        "total_lines": total_lines,
     })
+
+
+@app.post("/api/rules")
+async def api_create_rule(payload: dict, request: Request):
+    """Create a new voucher rule (admin only)."""
+    admin = await _require_admin(request)
+
+    rule_code = (payload.get("rule_code") or "").strip()
+    if not rule_code:
+        return JSONResponse({"error": "规则代码不能为空"}, status_code=400)
+
+    # Check for duplicate
+    existing = await get_rule(rule_code)
+    if existing:
+        return JSONResponse({"error": f"规则代码「{rule_code}」已存在"}, status_code=400)
+
+    lines = payload.get("lines", [])
+    if not lines:
+        return JSONResponse({"error": "至少需要一条分录行"}, status_code=400)
+
+    try:
+        rule = await create_rule(
+            rule_code=rule_code,
+            business_type=payload.get("business_type", "sales_revenue"),
+            product_type=payload.get("product_type", "*"),
+            tax_rate=payload.get("tax_rate", "*"),
+            document_type=payload.get("document_type", "DR"),
+            lines=lines,
+        )
+    except Exception as exc:
+        logger.error("Failed to create rule: %s", exc)
+        return JSONResponse({"error": "创建规则失败"}, status_code=500)
+
+    await add_audit_log(
+        action="rule.create",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="rule",
+        target_id=rule_code,
+    )
+
+    formatted = _format_rules_for_frontend([rule])
+    return JSONResponse({"rule": formatted[0] if formatted else {}}, status_code=201)
+
+
+@app.put("/api/rules/{rule_code}")
+async def api_update_rule(rule_code: str, payload: dict, request: Request):
+    """Update an existing voucher rule (admin only)."""
+    admin = await _require_admin(request)
+
+    existing = await get_rule(rule_code)
+    if not existing:
+        return JSONResponse({"error": "规则不存在"}, status_code=404)
+
+    lines = payload.get("lines")
+    try:
+        updated = await db_update_rule(
+            rule_code,
+            lines=lines,
+            business_type=payload.get("business_type"),
+            product_type=payload.get("product_type"),
+            tax_rate=payload.get("tax_rate"),
+            document_type=payload.get("document_type"),
+        )
+    except Exception as exc:
+        logger.error("Failed to update rule: %s", exc)
+        return JSONResponse({"error": "更新规则失败"}, status_code=500)
+
+    if not updated:
+        return JSONResponse({"error": "更新失败"}, status_code=500)
+
+    await add_audit_log(
+        action="rule.update",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="rule",
+        target_id=rule_code,
+    )
+
+    rule = await get_rule(rule_code)
+    formatted = _format_rules_for_frontend([rule])
+    return JSONResponse({"rule": formatted[0] if formatted else {}})
+
+
+@app.delete("/api/rules/{rule_code}")
+async def api_delete_rule(rule_code: str, request: Request):
+    """Delete a voucher rule (admin only)."""
+    admin = await _require_admin(request)
+
+    existing = await get_rule(rule_code)
+    if not existing:
+        return JSONResponse({"error": "规则不存在"}, status_code=404)
+
+    deleted = await db_delete_rule(rule_code)
+    if not deleted:
+        return JSONResponse({"error": "删除失败"}, status_code=500)
+
+    await add_audit_log(
+        action="rule.delete",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="rule",
+        target_id=rule_code,
+    )
+
+    return JSONResponse({"status": "ok"})
 
 
 # ── API: Voucher History ─────────────────────────────────────────────────────
@@ -1355,12 +1505,9 @@ async def api_list_vouchers(request: Request, status: str | None = None, limit: 
 
 @app.get("/api/vouchers/{voucher_id}")
 async def api_get_voucher(voucher_id: str, request: Request):
-    """Get a single voucher record with full data."""
+    """Get a single voucher record with full data in frontend format."""
     user = await _require_auth(request)
 
-    record = await list_voucher_records(limit=1)  # We need a specific query
-    # Use direct DB query
-    from database import get_voucher_record
     record = await get_voucher_record(voucher_id)
     if not record:
         return JSONResponse({"error": "凭证不存在"}, status_code=404)
@@ -1369,7 +1516,15 @@ async def api_get_voucher(voucher_id: str, request: Request):
     if user["role"] != "admin" and record["user_id"] != user["id"]:
         return JSONResponse({"error": "无权查看此凭证"}, status_code=403)
 
-    return JSONResponse({"voucher": record})
+    # Parse voucher_data JSON and return in frontend format
+    voucher_data = json.loads(record.get("voucher_data") or "{}")
+    voucher_data["status"] = record.get("status", "draft")
+    voucher_data["created_at"] = record.get("created_at")
+    voucher_data["posted_at"] = record.get("posted_at")
+    voucher_data["posted_by_name"] = record.get("posted_by_name")
+    voucher_data["user_display_name"] = record.get("user_display_name")
+
+    return JSONResponse({"voucher": voucher_data})
 
 
 # ── API: Audit Logs (admin only) ─────────────────────────────────────────────
@@ -1404,145 +1559,6 @@ async def api_chat_history(request: Request, limit: int = 100, offset: int = 0):
 
 
 # ── NL → Transaction via LLM ─────────────────────────────────────────────────
-
-NL_PARSE_SYSTEM_PROMPT = """\
-你是一个财务业务分类与数据抽取助手。用户会用自然语言描述一笔业务，你需要：
-1. 先判断用户的意图（intent）
-2. 如果是业务描述，再判断业务类型（business_type）并提取结构化数据
-
-## 意图判断规则
-
-- business：用户在描述一笔具体的财务/业务交易（如「卖软件给XX公司」「请客户吃饭花了560元」「采购了一台服务器」）
-- rule_query：用户在查看/查询凭证规则（如「凭证规则是什么」「我想看销售收入凭证怎么记」「费用报销怎么入账」「凭证规则」「查看规则」）
-- rule_mgmt：用户想新增/修改/删除凭证规则（如「新增费用报销的规则」「添加一条资产采购规则」「修改销售收入规则」「删除借款规则」）。关键词特征：新增、添加、创建、建立、修改、更新、删除、去掉
-- voucher_query：用户想查看已生成的凭证记录（如「查看我的凭证」「我生成的凭证有哪些」「凭证记录」「看看凭证」）
-- user_mgmt：管理员想通过对话添加或管理用户（如「添加一个用户」「新建用户张三」「添加普通用户李四密码123456」）
-- chat：用户在提问、闲聊、求助或与系统对话（如「你好」「你能做什么？」「什么是增值税？」）
-- unknown：无法判断
-
-如果 intent 不是 business，只需输出 intent 和相关字段，reply 中给出友好的回复。
-
-## rule_query 意图的处理
-
-当用户询问凭证规则时，需要判断用户问的是哪种业务类型的规则：
-- 如果用户明确提到了业务类型（如「销售收入的规则」「费用报销怎么记」），则提取 rule_type
-- 如果用户只是笼统地问（如「凭证规则是什么」「我想看规则」），则 rule_type 为 null
-
-rule_type 的可选值：sales_revenue / expense / asset_purchase / salary / loan
-
-## voucher_query 意图的处理
-
-当用户查看凭证记录时：
-- 如果用户指定了状态筛选（如「查看已过账的凭证」「草稿状态的凭证」），则提取 status
-- 如果用户没有指定状态，status 为 null 表示查看全部
-
-status 的可选值：draft / posted / null
-
-## user_mgmt 意图的处理
-
-当管理员想添加用户时，提取以下信息：
-- new_username：新用户的登录名
-- new_display_name：新用户的显示名称（如未提供则与 username 相同）
-- new_role：角色，user（普通用户）或 admin（管理员），默认 user
-- new_password：密码（如未提供则为 null，系统将生成默认密码）
-
-## 业务类型判断规则（仅 intent=business 时需要）
-
-- sales_revenue：销售商品或提供服务产生的收入（如「卖软件给XX公司」「提供咨询服务收费」）
-- expense：日常费用支出（如「请客户吃饭」「打车」「买办公用品」「报销差旅费」）
-- asset_purchase：购买固定资产或无形资产（如「采购服务器」「买办公设备」）
-- salary：工资薪酬相关（如「发工资」「社保公积金」）
-- loan：借款或还款（如「向银行贷款」「偿还借款」）
-- other：其他无法归类的业务
-
-## 目前系统仅支持处理的业务类型
-- sales_revenue（销售收入）
-
-如果 business_type 不是 sales_revenue，只需输出 business_type 字段即可，其他字段可以省略。
-
-请严格按照以下JSON格式输出，不要包含任何其他文字：
-
-### intent=chat 时：
-```json
-{
-  "intent": "chat",
-  "reply": "对用户问题的友好回答"
-}
-```
-
-### intent=rule_query 时：
-```json
-{
-  "intent": "rule_query",
-  "rule_type": "sales_revenue / expense / asset_purchase / salary / loan / null",
-  "reply": "对用户询问规则的引导性回复"
-}
-```
-如果用户明确指定了业务类型，rule_type 填对应的值，reply 中确认并说明即将展示该类型的规则。
-如果用户没有指定具体类型，rule_type 填 null，reply 中列出可查看规则的凭证类型，引导用户选择。
-
-### intent=rule_mgmt 时：
-```json
-{
-  "intent": "rule_mgmt",
-  "action": "create / update / delete",
-  "rule_type": "sales_revenue / expense / asset_purchase / salary / loan",
-  "reply": "对用户管理规则的确认或引导回复"
-}
-```
-注意区分 rule_query 和 rule_mgmt：
-- 「查看/查询/显示/看看」→ rule_query
-- 「新增/添加/创建/建立/修改/更新/删除/去掉」→ rule_mgmt
-例如「新增费用报销的规则」→ intent=rule_mgmt, action=create, rule_type=expense
-
-### intent=voucher_query 时：
-```json
-{
-  "intent": "voucher_query",
-  "status": "draft / posted / null",
-  "reply": "对用户查看凭证的确认回复"
-}
-```
-
-### intent=user_mgmt 时：
-```json
-{
-  "intent": "user_mgmt",
-  "action": "create",
-  "new_username": "登录名",
-  "new_display_name": "显示名称 或 null",
-  "new_role": "user / admin",
-  "new_password": "密码 或 null",
-  "reply": "对管理员操作的确认或引导回复"
-}
-```
-
-### intent=business 时：
-```json
-{
-  "intent": "business",
-  "business_type": "sales_revenue / expense / asset_purchase / salary / loan / other",
-  "transaction_id": "自动生成，格式 SO-YYYYMMDD-XXX",
-  "company_code": "1000",
-  "document_date": "YYYY-MM-DD",
-  "posting_date": "YYYY-MM-DD",
-  "customer_code": "从描述中提取客户编码，若无则用 C99999",
-  "customer_name": "从描述中提取客户名称",
-  "product_type": "software / service / saas / goods 之一",
-  "contract_no": "从描述中提取，若无则生成 CTR-YYYY-XX-XXX",
-  "invoice_no": "从描述中提取，若无则生成 INV-YYYYMMDD-XXXX",
-  "currency": "CNY",
-  "tax_rate": "0.13 或 0.06 或 0.00",
-  "tax_excluded_amount": "不含税金额，精确到分",
-  "tax_amount": "税额，精确到分",
-  "total_amount": "价税合计，精确到分",
-  "profit_center": "从描述中提取，若无则用 PC-DEFAULT",
-  "cost_center": "从描述中提取，若无则用 CC-DEFAULT"
-}
-```
-
-如果用户没有提供某些字段，请根据上下文合理推断。如果完全无法推断金额，返回 null。
-"""
 
 
 async def _parse_transaction_from_nl(message: str, history: list[dict] | None = None) -> dict | None:

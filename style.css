@@ -913,6 +913,69 @@ body {
     border-radius: 4px;
 }
 
+.rule-card-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+}
+
+/* ── Rule Edit Form (right panel) ──────────────────────────────────────────── */
+
+#viewRuleEdit .section {
+    animation: slideUp 0.3s ease-out forwards;
+}
+
+#viewRuleEdit .form-group input,
+#viewRuleEdit .form-group select {
+    width: 100%;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.9rem;
+    color: var(--text-main);
+    background: white;
+    transition: border-color 0.2s;
+}
+
+#viewRuleEdit .form-group input:focus,
+#viewRuleEdit .form-group select:focus {
+    border-color: var(--primary-color);
+    outline: none;
+}
+
+#viewRuleEdit .form-group input:disabled {
+    background: #f9fafb;
+    color: var(--text-secondary);
+    cursor: not-allowed;
+}
+
+.rule-edit-table select {
+    width: 100%;
+    border: 1px solid transparent;
+    padding: 6px;
+    border-radius: 4px;
+    transition: all 0.2s;
+    background: transparent;
+    font-size: 0.9rem;
+    color: var(--text-main);
+    cursor: pointer;
+}
+
+.rule-edit-table select:focus {
+    border-color: var(--primary-color);
+    background: white;
+    outline: none;
+}
+
+.rule-line-row .remove-line-btn {
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.rule-line-row:hover .remove-line-btn {
+    opacity: 1;
+}
+
 /* ── Login Overlay ─────────────────────────────────────────────────────────── */
 
 .login-overlay {
@@ -1076,6 +1139,14 @@ body {
     box-shadow: var(--shadow-md);
 }
 
+.voucher-card-clickable {
+    cursor: pointer;
+}
+
+.voucher-card-clickable:hover {
+    border-color: var(--primary-color);
+}
+
 .history-card-header {
     display: flex;
     justify-content: space-between;
@@ -1089,6 +1160,18 @@ body {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.history-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.btn-sm {
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    border-radius: 6px;
 }
 
 .voucher-id-badge {

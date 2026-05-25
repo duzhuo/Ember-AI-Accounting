@@ -117,6 +117,38 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+
+CREATE TABLE IF NOT EXISTS voucher_rules (
+    id TEXT PRIMARY KEY,
+    rule_code TEXT NOT NULL,
+    business_type TEXT NOT NULL,
+    product_type TEXT NOT NULL DEFAULT '*',
+    tax_rate TEXT NOT NULL DEFAULT '*',
+    document_type TEXT NOT NULL DEFAULT 'DR',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voucher_rule_lines (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    line_no INTEGER NOT NULL,
+    debit_credit TEXT NOT NULL,
+    account_code TEXT NOT NULL,
+    account_name TEXT NOT NULL,
+    amount_field TEXT NOT NULL,
+    customer_source TEXT NOT NULL DEFAULT '',
+    tax_code_rule TEXT NOT NULL DEFAULT '',
+    profit_center_source TEXT NOT NULL DEFAULT '',
+    cost_center_source TEXT NOT NULL DEFAULT '',
+    assignment_source TEXT NOT NULL DEFAULT '',
+    text_template TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (rule_id) REFERENCES voucher_rules(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_voucher_rules_code ON voucher_rules(rule_code);
+CREATE INDEX IF NOT EXISTS idx_voucher_rules_business ON voucher_rules(business_type);
+CREATE INDEX IF NOT EXISTS idx_voucher_rule_lines_rule ON voucher_rule_lines(rule_id);
 """
 
 
@@ -590,3 +622,206 @@ async def list_audit_logs(
         return result
     finally:
         await db.close()
+
+
+# ── Voucher rule operations ─────────────────────────────────────────────────
+
+
+async def create_rule(
+    rule_code: str,
+    business_type: str,
+    product_type: str = "*",
+    tax_rate: str = "*",
+    document_type: str = "DR",
+    lines: list[dict] | None = None,
+) -> dict:
+    """Create a new voucher rule with its lines. Returns the rule dict."""
+    rule_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO voucher_rules (id, rule_code, business_type, product_type, tax_rate, document_type, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rule_id, rule_code, business_type, product_type, tax_rate, document_type, now, now),
+        )
+        for line in (lines or []):
+            await db.execute(
+                """INSERT INTO voucher_rule_lines
+                   (id, rule_id, line_no, debit_credit, account_code, account_name, amount_field,
+                    customer_source, tax_code_rule, profit_center_source, cost_center_source,
+                    assignment_source, text_template)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), rule_id, line["line_no"], line["debit_credit"],
+                    line["account_code"], line["account_name"], line["amount_field"],
+                    line.get("customer_source", ""), line.get("tax_code_rule", ""),
+                    line.get("profit_center_source", ""), line.get("cost_center_source", ""),
+                    line.get("assignment_source", ""), line.get("text_template", ""),
+                ),
+            )
+        await db.commit()
+        return await get_rule(rule_code)
+    finally:
+        await db.close()
+
+
+async def list_rules(business_type: str | None = None) -> list[dict]:
+    """List all rules with their lines, optionally filtered by business_type."""
+    db = await get_db()
+    try:
+        if business_type:
+            cursor = await db.execute(
+                "SELECT * FROM voucher_rules WHERE business_type = ? ORDER BY rule_code",
+                (business_type,),
+            )
+        else:
+            cursor = await db.execute("SELECT * FROM voucher_rules ORDER BY rule_code")
+        rules = [dict(row) for row in await cursor.fetchall()]
+
+        for rule in rules:
+            cursor = await db.execute(
+                "SELECT * FROM voucher_rule_lines WHERE rule_id = ? ORDER BY line_no",
+                (rule["id"],),
+            )
+            rule["lines"] = [dict(row) for row in await cursor.fetchall()]
+        return rules
+    finally:
+        await db.close()
+
+
+async def get_rule(rule_code: str) -> dict | None:
+    """Get a single rule by rule_code with its lines."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM voucher_rules WHERE rule_code = ?", (rule_code,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        rule = dict(row)
+        cursor = await db.execute(
+            "SELECT * FROM voucher_rule_lines WHERE rule_id = ? ORDER BY line_no",
+            (rule["id"],),
+        )
+        rule["lines"] = [dict(row) for row in await cursor.fetchall()]
+        return rule
+    finally:
+        await db.close()
+
+
+async def update_rule(rule_code: str, lines: list[dict] | None = None, **kwargs) -> bool:
+    """Update a rule's header fields and optionally replace all lines."""
+    allowed = {"business_type", "product_type", "tax_rate", "document_type"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    now = datetime.now().isoformat()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM voucher_rules WHERE rule_code = ?", (rule_code,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return False
+        rule_id = row["id"]
+
+        if fields:
+            fields["updated_at"] = now
+            set_clause = ", ".join(f"{k} = ?" for k in fields)
+            await db.execute(
+                f"UPDATE voucher_rules SET {set_clause} WHERE id = ?",
+                list(fields.values()) + [rule_id],
+            )
+
+        if lines is not None:
+            await db.execute("DELETE FROM voucher_rule_lines WHERE rule_id = ?", (rule_id,))
+            for line in lines:
+                await db.execute(
+                    """INSERT INTO voucher_rule_lines
+                       (id, rule_id, line_no, debit_credit, account_code, account_name, amount_field,
+                        customer_source, tax_code_rule, profit_center_source, cost_center_source,
+                        assignment_source, text_template)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()), rule_id, line["line_no"], line["debit_credit"],
+                        line["account_code"], line["account_name"], line["amount_field"],
+                        line.get("customer_source", ""), line.get("tax_code_rule", ""),
+                        line.get("profit_center_source", ""), line.get("cost_center_source", ""),
+                        line.get("assignment_source", ""), line.get("text_template", ""),
+                    ),
+                )
+
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def delete_rule(rule_code: str) -> bool:
+    """Delete a rule and all its lines. Returns True if deleted."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "DELETE FROM voucher_rules WHERE rule_code = ?", (rule_code,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def migrate_rules_from_excel() -> int:
+    """Migrate rules from Excel file to database. Returns number of rules migrated."""
+    from voucher_rules import load_voucher_rule_lines
+
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM voucher_rules")
+        count = (await cursor.fetchone())[0]
+        if count > 0:
+            return 0
+    finally:
+        await db.close()
+
+    try:
+        rule_lines = load_voucher_rule_lines()
+    except Exception:
+        return 0
+
+    grouped: dict[str, list] = {}
+    for rl in rule_lines:
+        if rl.rule_code not in grouped:
+            grouped[rl.rule_code] = {
+                "business_type": rl.business_type,
+                "product_type": rl.product_type,
+                "tax_rate": rl.tax_rate,
+                "document_type": rl.document_type,
+                "lines": [],
+            }
+        grouped[rl.rule_code]["lines"].append({
+            "line_no": rl.line_no,
+            "debit_credit": rl.debit_credit,
+            "account_code": rl.account_code,
+            "account_name": rl.account_name,
+            "amount_field": rl.amount_field,
+            "customer_source": rl.customer_source,
+            "tax_code_rule": rl.tax_code_rule,
+            "profit_center_source": rl.profit_center_source,
+            "cost_center_source": rl.cost_center_source,
+            "assignment_source": rl.assignment_source,
+            "text_template": rl.text_template,
+        })
+
+    for rule_code, data in grouped.items():
+        await create_rule(
+            rule_code=rule_code,
+            business_type=data["business_type"],
+            product_type=data["product_type"],
+            tax_rate=data["tax_rate"],
+            document_type=data["document_type"],
+            lines=data["lines"],
+        )
+        logger.info("Migrated rule %s from Excel to database", rule_code)
+
+    return len(grouped)

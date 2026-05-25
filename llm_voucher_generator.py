@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from openai import AsyncOpenAI
 
+from prompts import VOUCHER_GENERATION_PROMPT
 from voucher_models import SalesTransaction, Voucher, VoucherLine
 from voucher_rules import build_sales_revenue_voucher
 
@@ -28,73 +29,6 @@ MODEL_API_KEY = os.environ.get(
     "4fea2171-9079-434e-bdf5-d98a00db9363",
 )
 MODEL_NAME = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
-
-# ── System prompt ────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """\
-你是一名专业的会计凭证生成助手。你的任务是根据提供的销售业务数据，按照中国会计准则生成对应的会计凭证草稿。
-
-## 销售收入凭证规则
-
-对于销售收入(sales_revenue)业务，按产品类型生成以下分录：
-
-### 第1行 — 借：应收账款（科目代码 112200）
-- 金额 = 价税合计 (total_amount)
-- 填入 customer_code、customer_name
-- profit_center：填入
-- cost_center：不填
-- assignment：填入 contract_no
-- debit_credit = "S"
-
-### 第2行 — 贷：主营业务收入
-- 金额 = 不含税金额 (tax_excluded_amount)
-- 产品类型为 software / service / saas → 科目代码 600101，名称"主营业务收入-软件服务"
-- 产品类型为 goods → 科目代码 600102，名称"主营业务收入-商品销售"
-- 不填 customer_code、customer_name
-- tax_code：按税率确定（13%→X1, 6%→X6, 0%→X0）
-- profit_center：填入；cost_center：填入；assignment：填入 contract_no
-- debit_credit = "H"
-
-### 第3行 — 贷：应交税费-应交增值税-销项税额（科目代码 22210105）
-- 金额 = 税额 (tax_amount)
-- tax_code：按税率确定（13%→X1, 6%→X6, 0%→X0）
-- profit_center：填入；cost_center：不填；assignment：填入 contract_no
-- debit_credit = "H"
-
-### 通用规则
-- 所有行项目的 text 统一为："确认客户{customer_name}销售收入，发票{invoice_no}"
-- 借方合计必须等于贷方合计
-- 不含税金额 + 税额 = 价税合计
-
-## 输出格式
-
-严格按以下 JSON 输出，不要包含任何其他文字：
-
-```json
-{
-  "header_text": "确认客户xxx销售收入，发票xxx",
-  "lines": [
-    {
-      "line_no": 1,
-      "debit_credit": "S",
-      "account_code": "112200",
-      "account_name": "应收账款",
-      "amount": "113000.00",
-      "customer_code": "C10086",
-      "customer_name": "客户名称",
-      "tax_code": "",
-      "profit_center": "PC-SOFTWARE",
-      "cost_center": "",
-      "assignment": "CTR-2026-SW-001",
-      "text": "确认客户xxx销售收入，发票xxx"
-    }
-  ],
-  "confidence": 0.95,
-  "warnings": []
-}
-```
-"""
-
 
 # ── Generator ─────────────────────────────────────────────────────────────────
 
@@ -127,7 +61,7 @@ class LLMVoucherGenerator:
         completion = await self._client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": VOUCHER_GENERATION_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,

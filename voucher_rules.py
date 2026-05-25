@@ -232,6 +232,7 @@ def load_voucher_rule_lines(path: str | Path = DEFAULT_RULE_CONFIG_PATH) -> list
 def build_sales_revenue_voucher(
     txn: SalesTransaction,
     rule_config_path: str | Path = DEFAULT_RULE_CONFIG_PATH,
+    rule_lines: list[VoucherRuleLine] | None = None,
 ) -> Voucher:
     """Generate a voucher draft from configurable sales revenue rules."""
 
@@ -242,8 +243,11 @@ def build_sales_revenue_voucher(
             "Total amount does not equal tax excluded amount plus tax amount.",
         )
 
+    if rule_lines is None:
+        rule_lines = load_voucher_rule_lines(rule_config_path)
+
     matching_rules = _match_rule_lines(
-        load_voucher_rule_lines(rule_config_path),
+        rule_lines,
         business_type="sales_revenue",
         product_type=txn.product_type,
         tax_rate=txn.tax_rate,

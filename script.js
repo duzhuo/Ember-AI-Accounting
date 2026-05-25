@@ -49,6 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
         voucher:     { title: '凭证详情',       showHeader: true, icon: 'ph-receipt' },
         voucher_list:{ title: '凭证记录',       showHeader: true, icon: 'ph-clock-counter-clockwise' },
         rules:       { title: '凭证规则',       showHeader: true, icon: 'ph-list-dashes' },
+        rule_edit:   { title: '编辑规则',       showHeader: true, icon: 'ph-pencil-simple' },
         user_list:   { title: '用户管理',       showHeader: true, icon: 'ph-users' },
     };
 
@@ -67,6 +68,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const targetId = viewName === 'voucher_list' ? 'viewVoucherList'
                        : viewName === 'user_list' ? 'viewUserList'
                        : viewName === 'rules' ? 'viewRules'
+                       : viewName === 'rule_edit' ? 'viewRuleEdit'
                        : viewName === 'voucher' ? 'viewVoucher'
                        : 'viewEmpty';
         const target = document.getElementById(targetId);
@@ -264,9 +266,14 @@ document.addEventListener('DOMContentLoaded', () => {
             currentVoucherId = data.voucher.voucher_id;
             activateWorkspace(data.voucher);
             switchView('voucher');
-        } else if (view === 'rules' && data.rules) {
-            renderRules(data.rules);
+        } else if (view === 'rules') {
+            renderRules(data.rules || [], data.rule_mgmt?.action);
             switchView('rules');
+            if (data.rule_mgmt) {
+                if (data.rule_mgmt.action === 'create') {
+                    openAddRuleModal(data.rule_mgmt.rule_type);
+                }
+            }
         } else if (view === 'voucher_list' && data.view_data) {
             renderVoucherList(data.view_data.vouchers, data.view_data.total, data.view_data.status_filter);
             switchView('voucher_list');
@@ -542,15 +549,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 const postedInfo = v.posted_at
                     ? `<span class="history-meta-item"><i class="ph ph-check-circle"></i> 过账: ${new Date(v.posted_at).toLocaleString('zh-CN')}</span>`
                     : '';
+                const postBtn = v.status === 'draft'
+                    ? `<button class="btn btn-primary btn-sm voucher-post-btn" data-vid="${v.voucher_id}"><i class="ph ph-check-circle"></i> 过账</button>`
+                    : '';
 
                 html += `
-                    <div class="history-card">
+                    <div class="history-card voucher-card-clickable" data-vid="${v.voucher_id}">
                         <div class="history-card-header">
                             <div class="history-card-title">
                                 <span class="voucher-id-badge">${v.voucher_id}</span>
                                 ${statusBadge}
                             </div>
-                            <span class="history-meta"><i class="ph ph-clock"></i> ${createdAt}</span>
+                            <div class="history-card-actions">
+                                ${postBtn}
+                                <span class="history-meta"><i class="ph ph-clock"></i> ${createdAt}</span>
+                            </div>
                         </div>
                         <div class="history-card-body">
                             <div class="history-meta-row">
@@ -587,6 +600,79 @@ document.addEventListener('DOMContentLoaded', () => {
                 refreshVoucherList(status);
             });
         }
+
+        // Click card to view detail
+        container.querySelectorAll('.voucher-card-clickable').forEach(card => {
+            card.addEventListener('click', (e) => {
+                // Don't navigate if clicking the post button
+                if (e.target.closest('.voucher-post-btn')) return;
+                const vid = card.dataset.vid;
+                fetchVoucherDetail(vid);
+            });
+        });
+
+        // Post buttons
+        container.querySelectorAll('.voucher-post-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const vid = btn.dataset.vid;
+                postVoucherFromList(vid, btn);
+            });
+        });
+    }
+
+    async function fetchVoucherDetail(voucherId) {
+        try {
+            const resp = await apiFetch(`/api/vouchers/${voucherId}`);
+            const data = await resp.json();
+            if (data.error) {
+                addMessage(`加载凭证失败：${data.error}`, 'ai');
+                return;
+            }
+            const v = data.voucher;
+            currentVoucherId = v.voucher_id;
+            activateWorkspace(v);
+            // If already posted, update button state
+            if (v.status === 'posted') {
+                isPosted = true;
+                createTransactionBtn.innerHTML = '<i class="ph ph-check"></i> 已记账';
+                createTransactionBtn.style.background = '#059669';
+                createTransactionBtn.disabled = true;
+            }
+            switchView('voucher');
+        } catch (err) {
+            addMessage('加载凭证详情失败，请重试。', 'ai');
+        }
+    }
+
+    async function postVoucherFromList(voucherId, btn) {
+        const origHTML = btn.innerHTML;
+        btn.innerHTML = '<i class="ph ph-spinner ph-spin"></i>';
+        btn.disabled = true;
+
+        try {
+            const resp = await apiFetch('/api/confirm', {
+                method: 'POST',
+                body: JSON.stringify({ voucher_id: voucherId }),
+            });
+            const data = await resp.json();
+
+            if (data.status === 'posted') {
+                addMessage(data.message, 'ai');
+                // Refresh the list to reflect updated status
+                const statusFilterEl = document.getElementById('vlStatusFilter');
+                const status = statusFilterEl ? (statusFilterEl.value || null) : null;
+                refreshVoucherList(status);
+            } else {
+                addMessage(data.message || '过账失败', 'ai');
+                btn.innerHTML = origHTML;
+                btn.disabled = false;
+            }
+        } catch (err) {
+            addMessage('过账失败，请重试。', 'ai');
+            btn.innerHTML = origHTML;
+            btn.disabled = false;
+        }
     }
 
     async function refreshVoucherList(status) {
@@ -605,11 +691,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- Rules View ---
-    function renderRules(rules) {
-        const container = document.getElementById('rulesContent');
-        const bizTypeLabels = { 'sales_revenue': '销售收入', 'expense': '费用报销', 'asset_purchase': '资产采购', 'salary': '工资薪酬', 'loan': '借款/还款' };
+    const bizTypeLabels = { 'sales_revenue': '销售收入', 'expense': '费用报销', 'asset_purchase': '资产采购', 'salary': '工资薪酬', 'loan': '借款/还款' };
 
-        let html = '';
+    function renderRules(rules, ruleMgmtAction) {
+        const container = document.getElementById('rulesContent');
+
+        let html = `
+            <div class="view-toolbar">
+                <div class="view-toolbar-info">
+                    <span class="view-count">${rules.length} 条规则</span>
+                </div>
+                <div class="view-toolbar-actions">
+                    <button class="btn btn-primary" id="addRuleBtn"><i class="ph ph-plus"></i> 新增规则</button>
+                </div>
+            </div>
+        `;
+
         rules.forEach(rule => {
             const bizLabel = bizTypeLabels[rule.business_type] || rule.business_type;
             const productLabel = rule.product_type === '*' ? '全部' : rule.product_type;
@@ -648,6 +745,10 @@ document.addEventListener('DOMContentLoaded', () => {
                             <span class="meta-tag"><i class="ph ph-percent"></i> 税率: ${taxLabel}</span>
                             <span class="meta-tag"><i class="ph ph-file-text"></i> 凭证类型: ${docLabel}</span>
                         </div>
+                        <div class="rule-card-actions">
+                            <button class="icon-btn-small edit-rule-btn" data-rule-code="${rule.rule_code}" title="编辑"><i class="ph ph-pencil"></i></button>
+                            <button class="icon-btn-small delete-rule-btn" data-rule-code="${rule.rule_code}" title="删除"><i class="ph ph-trash"></i></button>
+                        </div>
                     </div>
                     <table class="rule-lines-table">
                         <thead><tr><th>行号</th><th>借/贷</th><th>科目代码</th><th>科目名称</th><th>金额取值</th><th>客户来源</th><th>税码规则</th><th>利润中心</th><th>成本中心</th><th>分配</th><th>摘要模板</th></tr></thead>
@@ -658,6 +759,15 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         container.innerHTML = html;
+
+        // Bind events
+        container.querySelectorAll('.edit-rule-btn').forEach(btn => {
+            btn.addEventListener('click', () => openEditRuleModal(btn.dataset.ruleCode));
+        });
+        container.querySelectorAll('.delete-rule-btn').forEach(btn => {
+            btn.addEventListener('click', () => deleteRule(btn.dataset.ruleCode));
+        });
+        document.getElementById('addRuleBtn')?.addEventListener('click', () => openAddRuleModal());
     }
 
     // --- User List View ---
@@ -834,6 +944,215 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (err) {
             console.error('Failed to delete user:', err);
             alert('删除用户失败');
+        }
+    }
+
+    // ── Rule Edit View (right panel) ─────────────────────────────────────────
+
+    function openAddRuleModal(ruleType) {
+        renderRuleEditForm({ ruleType: ruleType || 'sales_revenue' });
+    }
+
+    async function openEditRuleModal(ruleCode) {
+        let rules = [];
+        try {
+            const resp = await apiFetch('/api/rules');
+            const data = await resp.json();
+            rules = data.rules || [];
+        } catch (err) {
+            alert('加载规则失败');
+            return;
+        }
+        const rule = rules.find(r => r.rule_code === ruleCode);
+        if (!rule) { alert('规则不存在'); return; }
+        renderRuleEditForm({ editRule: rule });
+    }
+
+    function renderRuleEditForm(opts = {}) {
+        const container = document.getElementById('ruleEditContent');
+        const editRule = opts.editRule;
+        const isEdit = !!editRule;
+        const bizType = editRule?.business_type || opts.ruleType || 'sales_revenue';
+        const title = isEdit ? `编辑规则 · ${editRule.rule_code}` : '新增规则';
+
+        const linesHTML = (editRule?.lines || [{}]).map((line, idx) => ruleLineRowHTML(line, idx + 1)).join('');
+
+        container.innerHTML = `
+            <form id="ruleForm">
+                <input type="hidden" id="editRuleCode" value="${editRule?.rule_code || ''}">
+
+                <div class="section">
+                    <div class="section-header">
+                        <h2>${title}</h2>
+                        <div class="header-actions">
+                            <button type="button" class="btn btn-secondary" id="cancelRuleEdit"><i class="ph ph-arrow-left"></i> 返回</button>
+                            <button type="submit" class="btn btn-primary"><i class="ph ph-check"></i> 保存规则</button>
+                        </div>
+                    </div>
+                    <div class="form-header-details">
+                        <div class="form-group">
+                            <label for="ruleCode">规则代码</label>
+                            <input type="text" id="ruleCode" value="${editRule?.rule_code || ''}" placeholder="EXPENSE_STANDARD" required ${isEdit ? 'disabled' : ''}>
+                        </div>
+                        <div class="form-group">
+                            <label for="ruleBusinessType">业务类型</label>
+                            <select id="ruleBusinessType" class="date-input">
+                                <option value="sales_revenue" ${bizType === 'sales_revenue' ? 'selected' : ''}>销售收入</option>
+                                <option value="expense" ${bizType === 'expense' ? 'selected' : ''}>费用报销</option>
+                                <option value="asset_purchase" ${bizType === 'asset_purchase' ? 'selected' : ''}>资产采购</option>
+                                <option value="salary" ${bizType === 'salary' ? 'selected' : ''}>工资薪酬</option>
+                                <option value="loan" ${bizType === 'loan' ? 'selected' : ''}>借款/还款</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="ruleProductType">产品类型</label>
+                            <input type="text" id="ruleProductType" value="${editRule?.product_type || '*'}" placeholder="*">
+                        </div>
+                        <div class="form-group">
+                            <label for="ruleTaxRate">税率</label>
+                            <input type="text" id="ruleTaxRate" value="${editRule?.tax_rate || '*'}" placeholder="*">
+                        </div>
+                        <div class="form-group">
+                            <label for="ruleDocType">凭证类型</label>
+                            <input type="text" id="ruleDocType" value="${editRule?.document_type || 'DR'}" placeholder="DR">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">
+                        <h2>分录行</h2>
+                        <div class="header-actions">
+                            <span class="badge" id="lineCount">${editRule?.lines?.length || 1} 行</span>
+                            <button type="button" class="btn btn-secondary" id="addLineBtn"><i class="ph ph-plus"></i> 添加行</button>
+                        </div>
+                    </div>
+                    <div class="voucher-table-wrapper">
+                        <table class="voucher-table rule-edit-table">
+                            <thead>
+                                <tr>
+                                    <th class="col-no">行号</th>
+                                    <th class="col-dc">借/贷</th>
+                                    <th class="col-acct">科目代码</th>
+                                    <th class="col-name">科目名称</th>
+                                    <th>金额取值</th>
+                                    <th>客户来源</th>
+                                    <th>税码规则</th>
+                                    <th>利润中心</th>
+                                    <th>成本中心</th>
+                                    <th>分配</th>
+                                    <th class="col-text">摘要模板</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="ruleLinesBody">${linesHTML}</tbody>
+                        </table>
+                    </div>
+                </div>
+            </form>
+        `;
+
+        // Bind events
+        document.getElementById('cancelRuleEdit').addEventListener('click', () => switchView('rules'));
+        document.getElementById('addLineBtn').addEventListener('click', () => {
+            const tbody = document.getElementById('ruleLinesBody');
+            const nextNo = tbody.querySelectorAll('tr').length + 1;
+            const tr = document.createElement('tr');
+            tr.innerHTML = ruleLineRowHTML({}, nextNo);
+            tr.querySelector('.remove-line-btn').addEventListener('click', () => { tr.remove(); updateLineCount(); });
+            tbody.appendChild(tr);
+            updateLineCount();
+        });
+        document.querySelectorAll('#ruleLinesBody .remove-line-btn').forEach(btn => {
+            btn.addEventListener('click', () => { btn.closest('tr').remove(); updateLineCount(); });
+        });
+        document.getElementById('ruleForm').addEventListener('submit', handleRuleFormSubmit);
+
+        switchView('rule_edit');
+    }
+
+    function updateLineCount() {
+        const count = document.querySelectorAll('#ruleLinesBody .rule-line-row').length;
+        const badge = document.getElementById('lineCount');
+        if (badge) badge.textContent = `${count} 行`;
+    }
+
+    function ruleLineRowHTML(data, lineNo) {
+        const d = data || {};
+        return `<tr class="rule-line-row">
+            <td><input type="number" class="rl-line-no" value="${lineNo}" min="1" style="width:50px"></td>
+            <td><select class="rl-debit-credit"><option value="S" ${d.debit_credit === 'S' ? 'selected' : ''}>借</option><option value="H" ${d.debit_credit === 'H' ? 'selected' : ''}>贷</option></select></td>
+            <td><input type="text" class="rl-account-code" value="${d.account_code || ''}" placeholder="112200"></td>
+            <td><input type="text" class="rl-account-name" value="${d.account_name || ''}" placeholder="应收账款"></td>
+            <td><select class="rl-amount-field"><option value="total_amount" ${d.amount_field === 'total_amount' ? 'selected' : ''}>价税合计</option><option value="tax_excluded_amount" ${d.amount_field === 'tax_excluded_amount' ? 'selected' : ''}>不含税金额</option><option value="tax_amount" ${d.amount_field === 'tax_amount' ? 'selected' : ''}>税额</option></select></td>
+            <td><input type="text" class="rl-customer-source" value="${d.customer_source || ''}" placeholder="customer"></td>
+            <td><input type="text" class="rl-tax-code-rule" value="${d.tax_code_rule || ''}" placeholder="by_tax_rate"></td>
+            <td><input type="text" class="rl-profit-center-source" value="${d.profit_center_source || ''}" placeholder="profit_center"></td>
+            <td><input type="text" class="rl-cost-center-source" value="${d.cost_center_source || ''}" placeholder="cost_center"></td>
+            <td><input type="text" class="rl-assignment-source" value="${d.assignment_source || ''}" placeholder="contract_no"></td>
+            <td><input type="text" class="rl-text-template" value="${d.text_template || ''}" placeholder="摘要模板"></td>
+            <td><button type="button" class="icon-btn-small remove-line-btn" title="删除行"><i class="ph ph-trash"></i></button></td>
+        </tr>`;
+    }
+
+    function collectRuleLines() {
+        const rows = document.querySelectorAll('#ruleLinesBody .rule-line-row');
+        return Array.from(rows).map((row, idx) => ({
+            line_no: parseInt(row.querySelector('.rl-line-no').value) || idx + 1,
+            debit_credit: row.querySelector('.rl-debit-credit').value,
+            account_code: row.querySelector('.rl-account-code').value.trim(),
+            account_name: row.querySelector('.rl-account-name').value.trim(),
+            amount_field: row.querySelector('.rl-amount-field').value,
+            customer_source: row.querySelector('.rl-customer-source').value.trim(),
+            tax_code_rule: row.querySelector('.rl-tax-code-rule').value.trim(),
+            profit_center_source: row.querySelector('.rl-profit-center-source').value.trim(),
+            cost_center_source: row.querySelector('.rl-cost-center-source').value.trim(),
+            assignment_source: row.querySelector('.rl-assignment-source').value.trim(),
+            text_template: row.querySelector('.rl-text-template').value.trim(),
+        }));
+    }
+
+    async function handleRuleFormSubmit(e) {
+        e.preventDefault();
+        const editCode = document.getElementById('editRuleCode').value;
+        const lines = collectRuleLines();
+        if (lines.length === 0) { alert('至少需要一条分录行'); return; }
+
+        const payload = {
+            rule_code: document.getElementById('ruleCode').value.trim(),
+            business_type: document.getElementById('ruleBusinessType').value,
+            product_type: document.getElementById('ruleProductType').value.trim() || '*',
+            tax_rate: document.getElementById('ruleTaxRate').value.trim() || '*',
+            document_type: document.getElementById('ruleDocType').value.trim() || 'DR',
+            lines: lines,
+        };
+
+        try {
+            if (editCode) {
+                await apiFetch(`/api/rules/${editCode}`, { method: 'PUT', body: JSON.stringify(payload) });
+            } else {
+                await apiFetch('/api/rules', { method: 'POST', body: JSON.stringify(payload) });
+            }
+            const resp = await apiFetch('/api/rules');
+            const data = await resp.json();
+            renderRules(data.rules || []);
+            switchView('rules');
+        } catch (err) {
+            console.error('Failed to save rule:', err);
+            alert('保存规则失败');
+        }
+    }
+
+    async function deleteRule(ruleCode) {
+        if (!confirm(`确定要删除规则「${ruleCode}」吗？此操作不可恢复。`)) return;
+        try {
+            await apiFetch(`/api/rules/${ruleCode}`, { method: 'DELETE' });
+            const resp = await apiFetch('/api/rules');
+            const data = await resp.json();
+            renderRules(data.rules || []);
+        } catch (err) {
+            console.error('Failed to delete rule:', err);
+            alert('删除规则失败');
         }
     }
 
