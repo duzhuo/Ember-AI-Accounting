@@ -155,8 +155,8 @@ def _get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
     return sid, session
 
 
-# Session timeout: 2 hours (in seconds)
-SESSION_TIMEOUT_HOURS = 2
+# Session timeout: 6 hours
+SESSION_TIMEOUT_HOURS = 6
 
 
 async def _is_session_expired(session_id: str) -> bool:
