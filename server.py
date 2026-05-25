@@ -432,7 +432,10 @@ async def chat(payload: dict, request: Request):
     )
 
     # Build a synthetic SalesTransaction from the natural language via LLM
-    parse_result = await _parse_transaction_from_nl(message)
+    # Pass recent conversation history so LLM can understand context
+    recent_history = await list_chat_messages(session_id=chat_session_id, limit=6)
+    history_for_llm = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
@@ -444,24 +447,51 @@ async def chat(payload: dict, request: Request):
     if parse_result.get("intent") == "chat":
         reply = parse_result["reply"]
 
-        # ── Keyword fallback: if LLM misclassifies as chat, detect voucher_query / user_mgmt ──
+        # ── Keyword fallback: if LLM misclassifies as chat, detect intent from context ──
         msg_lower = message.lower()
         voucher_keywords = ["查看凭证", "凭证记录", "我的凭证", "凭证列表", "已生成凭证", "看看凭证", "查凭证"]
         user_mgmt_keywords = ["添加用户", "新建用户", "创建用户", "增加用户"]
+        # Business type keywords for rule_query context fallback
+        biz_type_map = {
+            "销售收入": "sales_revenue", "销售": "sales_revenue",
+            "费用报销": "expense", "费用": "expense", "报销": "expense",
+            "资产采购": "asset_purchase", "资产": "asset_purchase", "采购": "asset_purchase",
+            "工资薪酬": "salary", "工资": "salary", "薪酬": "salary",
+            "借款": "loan", "还款": "loan", "贷款": "loan",
+        }
+
+        # Check if previous assistant message was a rule_query prompt
+        last_assistant_is_rule_prompt = False
+        if history_for_llm:
+            for m in reversed(history_for_llm):
+                if m["role"] == "assistant":
+                    if "凭证规则" in m["content"] or "凭证类型" in m["content"] or "哪种类型" in m["content"]:
+                        last_assistant_is_rule_prompt = True
+                    break
 
         if any(kw in msg_lower for kw in voucher_keywords):
             # Override intent to voucher_query
             parse_result = {"intent": "voucher_query", "status": None, "reply": reply, "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → voucher_query for '%s'", message[:60])
-            # Fall through to voucher_query handler below
 
         elif any(kw in msg_lower for kw in user_mgmt_keywords):
             # Override intent to user_mgmt
             parse_result = {"intent": "user_mgmt", "action": "create", "new_username": None, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → user_mgmt for '%s'", message[:60])
-            # Fall through to user_mgmt handler below
 
-        else:
+        elif last_assistant_is_rule_prompt:
+            # Context: previous message asked which rule type → this message is a selection
+            matched_type = None
+            for kw, biz_type in biz_type_map.items():
+                if kw in msg_lower:
+                    matched_type = biz_type
+                    break
+            if matched_type:
+                parse_result = {"intent": "rule_query", "rule_type": matched_type, "reply": "", "business_type": None, "transaction": None}
+                logger.info("Context fallback: chat → rule_query (type=%s) for '%s'", matched_type, message[:60])
+
+        if parse_result.get("intent") == "chat":
+            # Still chat after all fallbacks
             await save_chat_message(
                 session_id=chat_session_id,
                 user_id=user["id"],
@@ -1377,15 +1407,17 @@ status 的可选值：draft / posted / null
 """
 
 
-async def _parse_transaction_from_nl(message: str) -> dict | None:
+async def _parse_transaction_from_nl(message: str, history: list[dict] | None = None) -> dict | None:
     from openai import AsyncOpenAI
     import os
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
+        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
     )
-    api_key = os.environ.get("MIMO_API_KEY", "")
-    model_name = os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro")
+    api_key = os.environ.get(
+        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
+    )
+    model_name = os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro")
 
     today = date.today().strftime("%Y-%m-%d")
     user_prompt = (
@@ -1393,18 +1425,18 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
         "请先判断用户意图（intent），再进行后续处理。"
     )
 
+    # Build message list with conversation history for context
+    messages = [{"role": "system", "content": NL_PARSE_SYSTEM_PROMPT}]
+    if history:
+        for msg in history[-6:]:  # Last 3 turns (user + assistant pairs)
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_prompt})
+
     try:
-        client = AsyncOpenAI(
-            base_url=base_url,
-            api_key="placeholder",
-            default_headers={"api-key": api_key} if api_key else {},
-        )
+        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         completion = await client.chat.completions.create(
             model=model_name,
-            messages=[
-                {"role": "system", "content": NL_PARSE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             temperature=0.1,
         )
         raw = completion.choices[0].message.content
@@ -1498,12 +1530,14 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
     import base64
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
+        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
     )
-    api_key = os.environ.get("MIMO_API_KEY", "")
+    api_key = os.environ.get(
+        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
+    )
     model_name = os.environ.get(
         "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro"),
+        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
     )
 
     today = date.today().strftime("%Y-%m-%d")
@@ -1523,11 +1557,7 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
         return None
 
     try:
-        client = AsyncOpenAI(
-            base_url=base_url,
-            api_key="placeholder",
-            default_headers={"api-key": api_key} if api_key else {},
-        )
+        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         completion = await client.chat.completions.create(
             model=model_name,
             messages=[
@@ -1613,12 +1643,14 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
         return None
 
     base_url = os.environ.get(
-        "PMDE_BASE_URL", "https://api.xiaomimimo.com/v1"
+        "PMDE_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"
     )
-    api_key = os.environ.get("MIMO_API_KEY", "")
+    api_key = os.environ.get(
+        "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
+    )
     model_name = os.environ.get(
         "PMDE_VISION_MODEL_NAME",
-        os.environ.get("PMDE_MODEL_NAME", "mimo-v2.5-pro"),
+        os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
     )
 
     today = date.today().strftime("%Y-%m-%d")
@@ -1636,11 +1668,7 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
         page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
 
     try:
-        client = AsyncOpenAI(
-            base_url=base_url,
-            api_key="placeholder",
-            default_headers={"api-key": api_key} if api_key else {},
-        )
+        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         completion = await client.chat.completions.create(
             model=model_name,
             messages=[
