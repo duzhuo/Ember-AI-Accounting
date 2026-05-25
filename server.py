@@ -433,7 +433,8 @@ async def chat(payload: dict, request: Request):
 
     # Build a synthetic SalesTransaction from the natural language via LLM
     # Pass recent conversation history so LLM can understand context
-    recent_history = await list_chat_messages(session_id=chat_session_id, limit=6)
+    # DeepSeek V4 Pro supports 1M context; use 20 messages (10 turns) for good balance
+    recent_history = await list_chat_messages(session_id=chat_session_id, limit=20)
     history_for_llm = [{"role": m["role"], "content": m["content"]} for m in recent_history]
     parse_result = await _parse_transaction_from_nl(message, history=history_for_llm)
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
@@ -1542,7 +1543,7 @@ async def _parse_transaction_from_nl(message: str, history: list[dict] | None = 
     # Build message list with conversation history for context
     messages = [{"role": "system", "content": NL_PARSE_SYSTEM_PROMPT}]
     if history:
-        for msg in history[-6:]:  # Last 3 turns (user + assistant pairs)
+        for msg in history[-20:]:  # Last 10 turns (user + assistant pairs)
             messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_prompt})
 
