@@ -433,6 +433,7 @@ async def chat(payload: dict, request: Request):
 
     # Build a synthetic SalesTransaction from the natural language via LLM
     parse_result = await _parse_transaction_from_nl(message)
+    logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
             "reply": "抱歉，我暂时无法理解。请尝试更具体的描述，例如「销售软件产品给XX公司，不含税金额100000元，税率13%」，或上传Excel附件。",
@@ -442,17 +443,36 @@ async def chat(payload: dict, request: Request):
     # Handle chat intent — direct reply, no voucher generation
     if parse_result.get("intent") == "chat":
         reply = parse_result["reply"]
-        await save_chat_message(
-            session_id=chat_session_id,
-            user_id=user["id"],
-            role="assistant",
-            content=reply,
-            message_type="chat",
-        )
-        return JSONResponse({
-            "reply": reply,
-            "session_id": session_id,
-        })
+
+        # ── Keyword fallback: if LLM misclassifies as chat, detect voucher_query / user_mgmt ──
+        msg_lower = message.lower()
+        voucher_keywords = ["查看凭证", "凭证记录", "我的凭证", "凭证列表", "已生成凭证", "看看凭证", "查凭证"]
+        user_mgmt_keywords = ["添加用户", "新建用户", "创建用户", "增加用户"]
+
+        if any(kw in msg_lower for kw in voucher_keywords):
+            # Override intent to voucher_query
+            parse_result = {"intent": "voucher_query", "status": None, "reply": reply, "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → voucher_query for '%s'", message[:60])
+            # Fall through to voucher_query handler below
+
+        elif any(kw in msg_lower for kw in user_mgmt_keywords):
+            # Override intent to user_mgmt
+            parse_result = {"intent": "user_mgmt", "action": "create", "new_username": None, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → user_mgmt for '%s'", message[:60])
+            # Fall through to user_mgmt handler below
+
+        else:
+            await save_chat_message(
+                session_id=chat_session_id,
+                user_id=user["id"],
+                role="assistant",
+                content=reply,
+                message_type="chat",
+            )
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+            })
 
     # Handle rule_query intent — show voucher rules
     if parse_result.get("intent") == "rule_query":
@@ -543,7 +563,7 @@ async def chat(payload: dict, request: Request):
         if not rules_list:
             if not reply:
                 reply = f"暂无「{biz_label}」类型的凭证规则配置。"
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            return JSONResponse({"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type})
 
         if not reply:
             reply = f"以下是「{biz_label}」类型的凭证规则，共 {len(rules_list)} 条："
@@ -591,7 +611,12 @@ async def chat(payload: dict, request: Request):
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
             )
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+                "view": "voucher_list",
+                "view_data": {"vouchers": [], "total": 0, "status_filter": status_filter},
+            })
 
         if not reply:
             reply = f"共找到 {total} 条{status_label}凭证记录："

@@ -264,7 +264,7 @@ document.addEventListener('DOMContentLoaded', () => {
             currentVoucherId = data.voucher.voucher_id;
             activateWorkspace(data.voucher);
             switchView('voucher');
-        } else if (view === 'rules' && data.rules && data.rules.length > 0) {
+        } else if (view === 'rules' && data.rules) {
             renderRules(data.rules);
             switchView('rules');
         } else if (view === 'voucher_list' && data.view_data) {
