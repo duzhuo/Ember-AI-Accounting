@@ -820,3 +820,392 @@ body {
     padding: 2px 6px;
     border-radius: 4px;
 }
+
+/* ── Login Overlay ─────────────────────────────────────────────────────────── */
+
+.login-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--bg-color);
+    background-image:
+        radial-gradient(at 0% 0%, rgba(37, 99, 235, 0.1) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.1) 0px, transparent 50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.login-card {
+    width: 400px;
+    padding: 40px;
+    text-align: center;
+}
+
+.login-brand {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 24px;
+    font-size: 1.3rem;
+    font-weight: 600;
+}
+
+.login-card h2 {
+    margin-bottom: 24px;
+    color: var(--text-main);
+    font-size: 1.1rem;
+}
+
+.login-card .form-field {
+    margin-bottom: 16px;
+    text-align: left;
+}
+
+.login-card .form-field label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    font-weight: 500;
+}
+
+.login-card .form-field input {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    transition: border-color 0.2s;
+}
+
+.login-card .form-field input:focus {
+    border-color: var(--primary-color);
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.login-error {
+    background: #fef2f2;
+    color: #991b1b;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+    text-align: center;
+}
+
+.login-btn {
+    width: 100%;
+    padding: 12px;
+    font-size: 1rem;
+    justify-content: center;
+    margin-top: 8px;
+}
+
+.login-hint {
+    margin-top: 16px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+/* ── Sidebar Header ────────────────────────────────────────────────────────── */
+
+.sidebar-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.user-badge {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.user-badge i {
+    font-size: 1.1rem;
+}
+
+/* ── Voucher History ──────────────────────────────────────────────────────── */
+
+.history-container {
+    padding: var(--spacing-lg);
+    flex: 1;
+}
+
+.history-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-lg);
+}
+
+.history-select {
+    padding: 6px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 0.9rem;
+    color: var(--text-main);
+    background: white;
+    cursor: pointer;
+}
+
+.history-loading, .history-empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+}
+
+.history-loading i, .history-empty i {
+    font-size: 2rem;
+    display: block;
+    margin-bottom: 12px;
+}
+
+.history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.history-card {
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: white;
+    overflow: hidden;
+    transition: box-shadow 0.2s;
+}
+
+.history-card:hover {
+    box-shadow: var(--shadow-md);
+}
+
+.history-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 20px;
+    background: #f8fafc;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.history-card-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.voucher-id-badge {
+    background: var(--primary-color);
+    color: white;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    font-family: 'Courier New', monospace;
+}
+
+.status-badge {
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.status-posted {
+    background: #dcfce7;
+    color: #15803d;
+}
+
+.status-draft {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.history-meta {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.history-card-body {
+    padding: 14px 20px;
+}
+
+.history-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 6px;
+}
+
+.history-meta-row:last-child {
+    margin-bottom: 0;
+}
+
+.history-meta-item {
+    font-size: 0.85rem;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.history-meta-item i {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+/* ── User Management ──────────────────────────────────────────────────────── */
+
+.users-container {
+    padding: var(--spacing-lg);
+    flex: 1;
+}
+
+.users-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-lg);
+}
+
+.users-toolbar h2 {
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.users-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.users-table th {
+    text-align: left;
+    padding: 12px 16px;
+    background: #f8fafc;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.users-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid #f1f5f9;
+    font-size: 0.9rem;
+}
+
+.users-table tr:last-child td {
+    border-bottom: none;
+}
+
+.users-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.role-badge {
+    padding: 2px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.role-admin {
+    background: #ede9fe;
+    color: #6d28d9;
+}
+
+.role-user {
+    background: #e0e7ff;
+    color: #3730a3;
+}
+
+/* ── Modal ────────────────────────────────────────────────────────────────── */
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 500;
+}
+
+.modal-card {
+    width: 420px;
+    padding: 0;
+    border-radius: 16px;
+    overflow: hidden;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border-color);
+    background: #f8fafc;
+}
+
+.modal-header h3 {
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.modal-card .form-field {
+    padding: 0 24px;
+    margin-top: 16px;
+}
+
+.modal-card .form-field label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    font-weight: 500;
+}
+
+.modal-card .form-field input,
+.modal-card .form-field select {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 0.95rem;
+}
+
+.modal-card .form-field input:focus,
+.modal-card .form-field select:focus {
+    border-color: var(--primary-color);
+    outline: none;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 20px 24px;
+}
+
+.btn-secondary {
+    background: var(--bg-color);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+}
+
+.btn-secondary:hover {
+    background: #e5e7eb;
+}

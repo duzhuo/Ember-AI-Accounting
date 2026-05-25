@@ -1,9 +1,12 @@
 """FastAPI backend for the AI Accounting Voucher web app.
 
 Provides REST APIs for:
+  - Auth: login, logout, user management
   - Chat: natural language → LLM → voucher draft
-  - File upload: Excel attachment → parse → LLM → voucher draft
+  - File upload: Excel/image/PDF → parse → LLM → voucher draft
   - Confirm: mark voucher as posted
+  - Vouchers: list/query voucher history
+  - Audit: operation and conversation logging
 
 Run:
     source .venv/bin/activate
@@ -21,11 +24,30 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from database import (
+    add_audit_log,
+    authenticate_user,
+    create_session_token,
+    create_user,
+    delete_session,
+    delete_user,
+    get_user_by_token,
+    init_db,
+    list_audit_logs,
+    list_chat_messages,
+    list_users,
+    list_voucher_records,
+    mark_voucher_posted,
+    save_chat_message,
+    save_voucher_record,
+    update_user,
+    count_voucher_records,
+)
 from excel_loader import load_sales_transactions
 from llm_voucher_generator import LLMVoucherGenerator
 from sap_exporter import export_sap_csv
@@ -39,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 # ── App setup ────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Ember AI Accounting", version="1.1")
+app = FastAPI(title="Ember AI Accounting", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,9 +81,47 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 POSTED_CSV.parent.mkdir(parents=True, exist_ok=True)
 
-# ── Session persistence ─────────────────────────────────────────────────────
+# ── Globals ──────────────────────────────────────────────────────────────────
 
 generator = LLMVoucherGenerator()
+
+SUPPORTED_BUSINESS_TYPES = {
+    "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
+}
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+PDF_EXTENSIONS = {".pdf"}
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+
+async def _get_current_user(request: Request) -> dict | None:
+    """Extract and validate current user from Authorization header."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        return await get_user_by_token(token)
+    return None
+
+
+async def _require_auth(request: Request) -> dict:
+    """Require authenticated user. Raises HTTPException if not authenticated."""
+    user = await _get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    return user
+
+
+async def _require_admin(request: Request) -> dict:
+    """Require admin user. Raises HTTPException if not admin."""
+    user = await _require_auth(request)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+# ── Session persistence (for chat context) ───────────────────────────────────
 
 
 def _session_path(session_id: str) -> Path:
@@ -69,12 +129,10 @@ def _session_path(session_id: str) -> Path:
 
 
 def _load_session(session_id: str) -> dict[str, Any]:
-    """Load session from disk, or create a new one."""
     path = _session_path(session_id)
     if path.exists():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            # Re-hydrate Voucher objects from dicts
             raw["vouchers"] = [_dict_to_voucher(v) for v in raw.get("vouchers", [])]
             return raw
         except Exception:
@@ -83,7 +141,6 @@ def _load_session(session_id: str) -> dict[str, Any]:
 
 
 def _save_session(session_id: str, session: dict[str, Any]) -> None:
-    """Persist session to disk (vouchers stored as JSON-serialisable dicts)."""
     path = _session_path(session_id)
     data = {
         "vouchers": [_voucher_to_json(v) for v in session.get("vouchers", [])],
@@ -93,7 +150,6 @@ def _save_session(session_id: str, session: dict[str, Any]) -> None:
 
 
 def _get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
-    """Get or create a session. Returns (session_id, session_dict)."""
     sid = session_id or str(uuid.uuid4())
     session = _load_session(sid)
     return sid, session
@@ -101,8 +157,8 @@ def _get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
 
 # ── Helper: voucher ↔ JSON serialisable dict ─────────────────────────────────
 
+
 def _voucher_to_json(voucher: Voucher) -> dict:
-    """Convert a Voucher model to a JSON-safe dict for persistence."""
     from dataclasses import asdict
 
     def _convert(value: object) -> object:
@@ -120,7 +176,6 @@ def _voucher_to_json(voucher: Voucher) -> dict:
 
 
 def _dict_to_voucher(data: dict) -> Voucher:
-    """Reconstruct a Voucher (with VoucherLine list) from a JSON dict."""
     lines = [
         VoucherLine(
             line_no=ln["line_no"],
@@ -154,10 +209,7 @@ def _dict_to_voucher(data: dict) -> Voucher:
     )
 
 
-# ── Helper: voucher → frontend-friendly dict ─────────────────────────────────
-
 def _voucher_to_front(voucher: Voucher) -> dict:
-    """Convert a Voucher model to the JSON shape the frontend expects."""
     rows = []
     for line in voucher.lines:
         debit = float(line.amount) if line.debit_credit == "S" else 0
@@ -192,13 +244,176 @@ def _voucher_to_front(voucher: Voucher) -> dict:
     }
 
 
+# ── Startup event ────────────────────────────────────────────────────────────
+
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    logger.info("Database initialized")
+
+
+# ── API: Auth ─────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/auth/login")
+async def login(payload: dict, request: Request):
+    """Authenticate user and return a session token."""
+    username = payload.get("username", "").strip()
+    password = payload.get("password", "")
+
+    if not username or not password:
+        return JSONResponse({"error": "请输入用户名和密码"}, status_code=400)
+
+    user = await authenticate_user(username, password)
+    if not user:
+        await add_audit_log(action="login.failed", username=username, ip_address=request.client.host if request.client else None)
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+
+    token = await create_session_token(user["id"])
+    await add_audit_log(
+        action="login.success",
+        user_id=user["id"],
+        username=user["username"],
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return JSONResponse({
+        "token": token,
+        "user": user,
+    })
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """Logout the current user."""
+    user = await _get_current_user(request)
+    if user:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+            await delete_session(token)
+            await add_audit_log(action="logout", user_id=user["id"], username=user["username"])
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/auth/me")
+async def get_me(request: Request):
+    """Get current user info."""
+    user = await _get_current_user(request)
+    if not user:
+        return JSONResponse({"error": "未登录"}, status_code=401)
+    return JSONResponse({"user": user})
+
+
+# ── API: User Management (admin only) ────────────────────────────────────────
+
+
+@app.get("/api/users")
+async def api_list_users(request: Request):
+    """List all users (admin only)."""
+    await _require_admin(request)
+    users = await list_users()
+    # Remove password data
+    for u in users:
+        u.pop("password_hash", None)
+        u.pop("password_salt", None)
+    return JSONResponse({"users": users})
+
+
+@app.post("/api/users")
+async def api_create_user(payload: dict, request: Request):
+    """Create a new user (admin only)."""
+    admin = await _require_admin(request)
+
+    username = payload.get("username", "").strip()
+    password = payload.get("password", "")
+    display_name = payload.get("display_name", "").strip()
+    role = payload.get("role", "user")
+
+    if not username or not password or not display_name:
+        return JSONResponse({"error": "用户名、密码和显示名称不能为空"}, status_code=400)
+
+    if role not in ("user", "admin"):
+        return JSONResponse({"error": "无效的角色类型"}, status_code=400)
+
+    try:
+        user = await create_user(username, password, display_name, role)
+    except Exception as exc:
+        if "UNIQUE constraint" in str(exc):
+            return JSONResponse({"error": f"用户名「{username}」已存在"}, status_code=400)
+        raise
+
+    await add_audit_log(
+        action="user.create",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="user",
+        target_id=user["id"],
+        details={"new_username": username, "new_role": role},
+    )
+
+    return JSONResponse({"user": user}, status_code=201)
+
+
+@app.put("/api/users/{user_id}")
+async def api_update_user(user_id: str, payload: dict, request: Request):
+    """Update a user (admin only)."""
+    admin = await _require_admin(request)
+
+    # Don't allow admin to deactivate themselves
+    if user_id == admin["id"] and payload.get("is_active") == 0:
+        return JSONResponse({"error": "不能停用自己的账号"}, status_code=400)
+
+    updated = await update_user(user_id, **payload)
+    if not updated:
+        return JSONResponse({"error": "用户不存在"}, status_code=404)
+
+    await add_audit_log(
+        action="user.update",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="user",
+        target_id=user_id,
+        details=payload,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+@app.delete("/api/users/{user_id}")
+async def api_delete_user(user_id: str, request: Request):
+    """Delete a user (admin only)."""
+    admin = await _require_admin(request)
+
+    if user_id == admin["id"]:
+        return JSONResponse({"error": "不能删除自己的账号"}, status_code=400)
+
+    deleted = await delete_user(user_id)
+    if not deleted:
+        return JSONResponse({"error": "用户不存在"}, status_code=404)
+
+    await add_audit_log(
+        action="user.delete",
+        user_id=admin["id"],
+        username=admin["username"],
+        target_type="user",
+        target_id=user_id,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
 # ── API: Chat ────────────────────────────────────────────────────────────────
 
+
 @app.post("/api/chat")
-async def chat(payload: dict):
+async def chat(payload: dict, request: Request):
     """Accept a natural language message and optional session_id, return AI response + voucher data."""
+    user = await _require_auth(request)
     message = payload.get("message", "").strip()
     session_id = payload.get("session_id")
+    chat_session_id = session_id or str(uuid.uuid4())
     session_id, session = _get_session(session_id)
 
     if not message:
@@ -206,6 +421,15 @@ async def chat(payload: dict):
             "reply": "请描述一笔业务，比如「请客户吃饭花了1200元」，或上传一张发票。",
             "session_id": session_id,
         })
+
+    # Save user message to audit
+    await save_chat_message(
+        session_id=chat_session_id,
+        user_id=user["id"],
+        role="user",
+        content=message,
+        message_type="chat",
+    )
 
     # Build a synthetic SalesTransaction from the natural language via LLM
     parse_result = await _parse_transaction_from_nl(message)
@@ -217,8 +441,16 @@ async def chat(payload: dict):
 
     # Handle chat intent — direct reply, no voucher generation
     if parse_result.get("intent") == "chat":
+        reply = parse_result["reply"]
+        await save_chat_message(
+            session_id=chat_session_id,
+            user_id=user["id"],
+            role="assistant",
+            content=reply,
+            message_type="chat",
+        )
         return JSONResponse({
-            "reply": parse_result["reply"],
+            "reply": reply,
             "session_id": session_id,
         })
 
@@ -227,14 +459,29 @@ async def chat(payload: dict):
         rule_type = parse_result.get("rule_type")
         reply = parse_result.get("reply", "")
 
+        await add_audit_log(
+            action="rule.view",
+            user_id=user["id"],
+            username=user["username"],
+            target_type="rule",
+            details={"rule_type": rule_type},
+        )
+
         if rule_type is None:
-            # User didn't specify a type — guide them to pick one
             available_types = {
                 "sales_revenue": "销售收入",
             }
             type_list = "\n".join(f"  {i+1}. {desc}" for i, desc in enumerate(available_types.values()))
             if not reply:
                 reply = f"目前系统支持以下凭证类型的规则查看：\n{type_list}\n\n请告诉我您想查看哪种类型的凭证规则？"
+
+            await save_chat_message(
+                session_id=chat_session_id,
+                user_id=user["id"],
+                role="assistant",
+                content=reply,
+                message_type="chat",
+            )
             return JSONResponse({
                 "reply": reply,
                 "session_id": session_id,
@@ -250,7 +497,6 @@ async def chat(payload: dict):
                 "session_id": session_id,
             })
 
-        # Filter rules by the requested business_type
         filtered_rules: dict[str, list[dict]] = {}
         for rl in rule_lines:
             if rl.business_type != rule_type:
@@ -297,13 +543,20 @@ async def chat(payload: dict):
         if not rules_list:
             if not reply:
                 reply = f"暂无「{biz_label}」类型的凭证规则配置。"
-            return JSONResponse({
-                "reply": reply,
-                "session_id": session_id,
-            })
+            return JSONResponse({"reply": reply, "session_id": session_id})
 
         if not reply:
             reply = f"以下是「{biz_label}」类型的凭证规则，共 {len(rules_list)} 条："
+
+        await save_chat_message(
+            session_id=chat_session_id,
+            user_id=user["id"],
+            role="assistant",
+            content=reply,
+            message_type="chat",
+            metadata={"rule_type": rule_type},
+        )
+
         return JSONResponse({
             "reply": reply,
             "session_id": session_id,
@@ -327,12 +580,20 @@ async def chat(payload: dict):
             "other": "其他",
         }.get(business_type, business_type)
 
+        reply = (
+            f"抱歉，当前系统暂不支持「{type_display}」类型的凭证生成。\n\n"
+            f"目前支持的凭证类型：\n{supported_list}\n\n"
+            "请描述一笔支持的业务，或上传Excel附件。"
+        )
+        await save_chat_message(
+            session_id=chat_session_id,
+            user_id=user["id"],
+            role="assistant",
+            content=reply,
+            message_type="chat",
+        )
         return JSONResponse({
-            "reply": (
-                f"抱歉，当前系统暂不支持「{type_display}」类型的凭证生成。\n\n"
-                f"目前支持的凭证类型：\n{supported_list}\n\n"
-                "请描述一笔支持的业务，或上传Excel附件。"
-            ),
+            "reply": reply,
             "session_id": session_id,
         })
 
@@ -340,21 +601,55 @@ async def chat(payload: dict):
     session["vouchers"].append(voucher)
     _save_session(session_id, session)
 
+    # Save voucher record to database
+    voucher_front = _voucher_to_front(voucher)
+    await save_voucher_record(
+        voucher_id=voucher.voucher_id,
+        user_id=user["id"],
+        voucher_data=voucher_front,
+        session_id=session_id,
+        company_code=voucher.company_code,
+        document_type=voucher.document_type,
+        document_date=voucher.document_date,
+        posting_date=voucher.posting_date,
+        reference=voucher.reference,
+        header_text=voucher.header_text,
+        confidence=str(voucher.confidence),
+        warnings=voucher.warnings,
+    )
+
+    # Audit log
+    await add_audit_log(
+        action="voucher.generate",
+        user_id=user["id"],
+        username=user["username"],
+        target_type="voucher",
+        target_id=voucher.voucher_id,
+        details={"business_type": business_type},
+    )
+
     reply = f"已为您生成凭证草稿（置信度 {voucher.confidence}）。"
     if voucher.warnings:
         reply += f" ⚠️ 注意：{'；'.join(voucher.warnings)}"
 
+    await save_chat_message(
+        session_id=chat_session_id,
+        user_id=user["id"],
+        role="assistant",
+        content=reply,
+        message_type="chat",
+        metadata={"voucher_id": voucher.voucher_id},
+    )
+
     return JSONResponse({
         "reply": reply,
         "session_id": session_id,
-        "voucher": _voucher_to_front(voucher),
+        "voucher": voucher_front,
     })
 
 
 # ── API: File Upload ─────────────────────────────────────────────────────────
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-PDF_EXTENSIONS = {".pdf"}
 
 IMAGE_PARSE_SYSTEM_PROMPT = """\
 你是一个财务单据识别助手。用户会上传一张发票或财务单据的图片，你需要从中识别并提取结构化的交易数据。
@@ -406,11 +701,24 @@ IMAGE_PARSE_SYSTEM_PROMPT = """\
 
 @app.post("/api/upload")
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     session_id: str | None = None,
 ):
     """Upload an Excel or image file, parse it, generate vouchers via LLM."""
+    user = await _require_auth(request)
+    chat_session_id = session_id or str(uuid.uuid4())
     session_id, session = _get_session(session_id)
+
+    # Save user message
+    await save_chat_message(
+        session_id=chat_session_id,
+        user_id=user["id"],
+        role="user",
+        content=f"上传文件: {file.filename}",
+        message_type="upload",
+        metadata={"filename": file.filename},
+    )
 
     # Save uploaded file
     file_id = str(uuid.uuid4())[:8]
@@ -436,37 +744,30 @@ async def upload_file(
         source_label = "PDF" if suffix in PDF_EXTENSIONS else "图片"
 
         if result is None:
+            reply = f"{source_label}识别失败，无法提取有效信息。请确保内容清晰且包含完整的发票/单据信息。"
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload")
             return JSONResponse({
-                "reply": f"{source_label}识别失败，无法提取有效信息。请确保内容清晰且包含完整的发票/单据信息。",
+                "reply": reply,
                 "session_id": session_id,
                 "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             })
 
         business_type = result.get("business_type", "other")
         if business_type not in SUPPORTED_BUSINESS_TYPES:
-            supported_list = "\n".join(
-                f"  - {desc}" for desc in SUPPORTED_BUSINESS_TYPES.values()
-            )
-            type_display = {
-                "expense": "费用报销",
-                "asset_purchase": "资产采购",
-                "salary": "工资薪酬",
-                "loan": "借款/还款",
-                "other": "其他",
-            }.get(business_type, business_type)
+            supported_list = "\n".join(f"  - {desc}" for desc in SUPPORTED_BUSINESS_TYPES.values())
+            type_display = {"expense": "费用报销", "asset_purchase": "资产采购", "salary": "工资薪酬", "loan": "借款/还款", "other": "其他"}.get(business_type, business_type)
+            reply = f"已识别单据类型为「{type_display}」，但当前系统暂不支持该类型的凭证生成。\n\n目前支持的凭证类型：\n{supported_list}"
             return JSONResponse({
-                "reply": (
-                    f"已识别单据类型为「{type_display}」，但当前系统暂不支持该类型的凭证生成。\n\n"
-                    f"目前支持的凭证类型：\n{supported_list}"
-                ),
+                "reply": reply,
                 "session_id": session_id,
                 "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             })
 
         txn = result.get("transaction")
         if txn is None:
+            reply = f"{source_label}识别成功，但未能提取到完整的交易金额信息。请上传更清晰的文件。"
             return JSONResponse({
-                "reply": f"{source_label}识别成功，但未能提取到完整的交易金额信息。请上传更清晰的文件。",
+                "reply": reply,
                 "session_id": session_id,
                 "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             })
@@ -475,15 +776,42 @@ async def upload_file(
         session["vouchers"].append(voucher)
         _save_session(session_id, session)
 
+        voucher_front = _voucher_to_front(voucher)
+        await save_voucher_record(
+            voucher_id=voucher.voucher_id,
+            user_id=user["id"],
+            voucher_data=voucher_front,
+            session_id=session_id,
+            company_code=voucher.company_code,
+            document_type=voucher.document_type,
+            document_date=voucher.document_date,
+            posting_date=voucher.posting_date,
+            reference=voucher.reference,
+            header_text=voucher.header_text,
+            confidence=str(voucher.confidence),
+            warnings=voucher.warnings,
+        )
+        await add_audit_log(
+            action="voucher.generate",
+            user_id=user["id"],
+            username=user["username"],
+            target_type="voucher",
+            target_id=voucher.voucher_id,
+            details={"source": source_label, "filename": file.filename},
+        )
+
         # Export to SAP CSV
         output_path = PROJECT_ROOT / "data" / "output" / f"sap_{file_id}.csv"
         export_sap_csv([voucher], output_path)
 
+        reply = f"已从{source_label}中识别出1笔销售收入交易，生成了1张凭证草稿。"
+        await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": voucher.voucher_id})
+
         return JSONResponse({
-            "reply": f"已从{source_label}中识别出1笔销售收入交易，生成了1张凭证草稿。",
+            "reply": reply,
             "session_id": session_id,
             "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
-            "vouchers": [_voucher_to_front(voucher)],
+            "vouchers": [voucher_front],
         })
 
     # ── Excel path: original logic ──
@@ -502,6 +830,30 @@ async def upload_file(
         session["vouchers"].append(voucher)
         vouchers.append(voucher)
 
+        voucher_front = _voucher_to_front(voucher)
+        await save_voucher_record(
+            voucher_id=voucher.voucher_id,
+            user_id=user["id"],
+            voucher_data=voucher_front,
+            session_id=session_id,
+            company_code=voucher.company_code,
+            document_type=voucher.document_type,
+            document_date=voucher.document_date,
+            posting_date=voucher.posting_date,
+            reference=voucher.reference,
+            header_text=voucher.header_text,
+            confidence=str(voucher.confidence),
+            warnings=voucher.warnings,
+        )
+        await add_audit_log(
+            action="voucher.generate",
+            user_id=user["id"],
+            username=user["username"],
+            target_type="voucher",
+            target_id=voucher.voucher_id,
+            details={"source": "excel", "filename": file.filename},
+        )
+
     _save_session(session_id, session)
 
     reply = f"已解析 {len(transactions)} 笔交易，生成了 {len(vouchers)} 张凭证草稿。"
@@ -509,6 +861,8 @@ async def upload_file(
     # Export to SAP CSV
     output_path = PROJECT_ROOT / "data" / "output" / f"sap_{file_id}.csv"
     export_sap_csv(vouchers, output_path)
+
+    await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_count": len(vouchers)})
 
     return JSONResponse({
         "reply": reply,
@@ -518,58 +872,13 @@ async def upload_file(
     })
 
 
-# ── API: Voucher Rules ───────────────────────────────────────────────────────
+# ── API: Confirm Voucher ─────────────────────────────────────────────────────
 
-@app.get("/api/rules")
-async def get_voucher_rules():
-    """Return the current voucher rule configuration as JSON."""
-    try:
-        rule_lines = load_voucher_rule_lines()
-    except Exception as exc:
-        logger.error("Failed to load voucher rules: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-    # Group by rule_code for better display
-    rules_grouped: dict[str, list[dict]] = {}
-    for rl in rule_lines:
-        if rl.rule_code not in rules_grouped:
-            rules_grouped[rl.rule_code] = {
-                "rule_code": rl.rule_code,
-                "business_type": rl.business_type,
-                "product_type": rl.product_type,
-                "tax_rate": rl.tax_rate,
-                "document_type": rl.document_type,
-                "lines": [],
-            }
-        rules_grouped[rl.rule_code]["lines"].append({
-            "line_no": rl.line_no,
-            "debit_credit": rl.debit_credit,
-            "debit_credit_display": "借" if rl.debit_credit == "S" else "贷",
-            "account_code": rl.account_code,
-            "account_name": rl.account_name,
-            "amount_field": rl.amount_field,
-            "amount_field_display": {
-                "total_amount": "价税合计",
-                "tax_excluded_amount": "不含税金额",
-                "tax_amount": "税额",
-            }.get(rl.amount_field, rl.amount_field),
-            "customer_source": rl.customer_source,
-            "tax_code_rule": rl.tax_code_rule,
-            "profit_center_source": rl.profit_center_source,
-            "cost_center_source": rl.cost_center_source,
-            "assignment_source": rl.assignment_source,
-            "text_template": rl.text_template,
-        })
-
-    return JSONResponse({
-        "rules": list(rules_grouped.values()),
-        "total_rules": len(rules_grouped),
-        "total_lines": len(rule_lines),
-    })
 
 @app.post("/api/confirm")
-async def confirm_voucher(payload: dict):
-    """Mark a voucher as posted: append to posted_vouchers.csv + update session."""
+async def confirm_voucher(payload: dict, request: Request):
+    """Mark a voucher as posted: append to posted_vouchers.csv + update session + audit."""
+    user = await _require_auth(request)
     session_id = payload.get("session_id")
     voucher_id = payload.get("voucher_id")
     session_id, session = _get_session(session_id)
@@ -592,7 +901,30 @@ async def confirm_voucher(payload: dict):
         session["posted_voucher_ids"].append(voucher_id)
     _save_session(session_id, session)
 
-    logger.info("Voucher %s posted and saved to %s", voucher_id, POSTED_CSV)
+    # Update database record
+    await mark_voucher_posted(voucher_id, user["id"])
+
+    # Audit log
+    await add_audit_log(
+        action="voucher.post",
+        user_id=user["id"],
+        username=user["username"],
+        target_type="voucher",
+        target_id=voucher_id,
+        details={"session_id": session_id},
+    )
+
+    # Save chat message for audit
+    await save_chat_message(
+        session_id=session_id or "unknown",
+        user_id=user["id"],
+        role="assistant",
+        content=f"凭证 {voucher_id} 已确认记账",
+        message_type="confirm",
+        metadata={"voucher_id": voucher_id},
+    )
+
+    logger.info("Voucher %s posted by %s and saved to %s", voucher_id, user["username"], POSTED_CSV)
 
     return JSONResponse({
         "status": "posted",
@@ -633,6 +965,130 @@ def _append_posted_csv(voucher: Voucher) -> None:
                 "ZUONR": line.assignment,
                 "SGTXT": line.text,
             })
+
+
+# ── API: Voucher Rules ───────────────────────────────────────────────────────
+
+
+@app.get("/api/rules")
+async def get_voucher_rules(request: Request):
+    """Return the current voucher rule configuration as JSON."""
+    user = await _require_auth(request)
+
+    try:
+        rule_lines = load_voucher_rule_lines()
+    except Exception as exc:
+        logger.error("Failed to load voucher rules: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    rules_grouped: dict[str, list[dict]] = {}
+    for rl in rule_lines:
+        if rl.rule_code not in rules_grouped:
+            rules_grouped[rl.rule_code] = {
+                "rule_code": rl.rule_code,
+                "business_type": rl.business_type,
+                "product_type": rl.product_type,
+                "tax_rate": rl.tax_rate,
+                "document_type": rl.document_type,
+                "lines": [],
+            }
+        rules_grouped[rl.rule_code]["lines"].append({
+            "line_no": rl.line_no,
+            "debit_credit": rl.debit_credit,
+            "debit_credit_display": "借" if rl.debit_credit == "S" else "贷",
+            "account_code": rl.account_code,
+            "account_name": rl.account_name,
+            "amount_field": rl.amount_field,
+            "amount_field_display": {
+                "total_amount": "价税合计",
+                "tax_excluded_amount": "不含税金额",
+                "tax_amount": "税额",
+            }.get(rl.amount_field, rl.amount_field),
+            "customer_source": rl.customer_source,
+            "tax_code_rule": rl.tax_code_rule,
+            "profit_center_source": rl.profit_center_source,
+            "cost_center_source": rl.cost_center_source,
+            "assignment_source": rl.assignment_source,
+            "text_template": rl.text_template,
+        })
+
+    return JSONResponse({
+        "rules": list(rules_grouped.values()),
+        "total_rules": len(rules_grouped),
+        "total_lines": len(rule_lines),
+    })
+
+
+# ── API: Voucher History ─────────────────────────────────────────────────────
+
+
+@app.get("/api/vouchers")
+async def api_list_vouchers(request: Request, status: str | None = None, limit: int = 50, offset: int = 0):
+    """List voucher records for the current user (or all for admin)."""
+    user = await _require_auth(request)
+
+    # Regular users see only their own vouchers; admins see all
+    user_id = None if user["role"] == "admin" else user["id"]
+
+    records = await list_voucher_records(user_id=user_id, status=status, limit=limit, offset=offset)
+    total = await count_voucher_records(user_id=user_id, status=status)
+
+    return JSONResponse({
+        "vouchers": records,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.get("/api/vouchers/{voucher_id}")
+async def api_get_voucher(voucher_id: str, request: Request):
+    """Get a single voucher record with full data."""
+    user = await _require_auth(request)
+
+    record = await list_voucher_records(limit=1)  # We need a specific query
+    # Use direct DB query
+    from database import get_voucher_record
+    record = await get_voucher_record(voucher_id)
+    if not record:
+        return JSONResponse({"error": "凭证不存在"}, status_code=404)
+
+    # Check access: regular users can only see their own vouchers
+    if user["role"] != "admin" and record["user_id"] != user["id"]:
+        return JSONResponse({"error": "无权查看此凭证"}, status_code=403)
+
+    return JSONResponse({"voucher": record})
+
+
+# ── API: Audit Logs (admin only) ─────────────────────────────────────────────
+
+
+@app.get("/api/audit-logs")
+async def api_list_audit_logs(request: Request, action: str | None = None, limit: int = 100, offset: int = 0):
+    """List audit logs (admin only)."""
+    await _require_admin(request)
+
+    logs = await list_audit_logs(action=action, limit=limit, offset=offset)
+
+    return JSONResponse({
+        "logs": logs,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.get("/api/chat-history")
+async def api_chat_history(request: Request, limit: int = 100, offset: int = 0):
+    """List chat messages (admin only, for audit)."""
+    await _require_admin(request)
+
+    messages = await list_chat_messages(limit=limit, offset=offset)
+
+    return JSONResponse({
+        "messages": messages,
+        "limit": limit,
+        "offset": offset,
+    })
 
 
 # ── NL → Transaction via LLM ─────────────────────────────────────────────────
@@ -722,21 +1178,7 @@ rule_type 的可选值：sales_revenue / expense / asset_purchase / salary / loa
 """
 
 
-# Supported business types and their display names
-SUPPORTED_BUSINESS_TYPES = {
-    "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
-}
-
-
 async def _parse_transaction_from_nl(message: str) -> dict | None:
-    """Use LLM to extract intent, business_type and SalesTransaction from natural language.
-
-    Returns a dict with keys:
-      - intent: str — "business" or "chat"
-      - reply: str | None — chat reply (when intent=chat)
-      - business_type: str — the classified business type (when intent=business)
-      - transaction: SalesTransaction | None — structured data
-    """
     from openai import AsyncOpenAI
     import os
 
@@ -766,7 +1208,6 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
         )
         raw = completion.choices[0].message.content
 
-        # Extract JSON
         json_str = raw.strip()
         if "```json" in json_str:
             json_str = json_str.split("```json")[1].split("```")[0].strip()
@@ -774,10 +1215,8 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
             json_str = json_str.split("```")[1].split("```")[0].strip()
 
         data = json.loads(json_str)
-
         intent = data.get("intent", "unknown")
 
-        # Handle chat / question intent
         if intent == "chat":
             return {
                 "intent": "chat",
@@ -786,24 +1225,20 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
                 "transaction": None,
             }
 
-        # Handle rule query intent
         if intent == "rule_query":
             return {
                 "intent": "rule_query",
-                "rule_type": data.get("rule_type"),  # None if user didn't specify a type
+                "rule_type": data.get("rule_type"),
                 "reply": data.get("reply", ""),
                 "business_type": None,
                 "transaction": None,
             }
 
-        # Handle business intent
         business_type = data.get("business_type", "other")
 
-        # For non-sales_revenue types, return the classification without transaction
         if business_type != "sales_revenue":
             return {"intent": "business", "business_type": business_type, "transaction": None}
 
-        # For sales_revenue, parse full transaction
         if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
             return {"intent": "business", "business_type": business_type, "transaction": None}
 
@@ -835,12 +1270,6 @@ async def _parse_transaction_from_nl(message: str) -> dict | None:
 
 
 async def _parse_image_to_transaction(image_path: Path) -> dict | None:
-    """Use multimodal LLM to extract business_type and SalesTransaction from an image.
-
-    Returns a dict with keys:
-      - business_type: str
-      - transaction: SalesTransaction | None
-    """
     from openai import AsyncOpenAI
     import os
     import base64
@@ -851,7 +1280,6 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
     api_key = os.environ.get(
         "PMDE_API_KEY", "4fea2171-9079-434e-bdf5-d98a00db9363"
     )
-    # Use a vision-capable model; fall back to the default if not set
     model_name = os.environ.get(
         "PMDE_VISION_MODEL_NAME",
         os.environ.get("PMDE_MODEL_NAME", "deepseek-v4-pro"),
@@ -859,20 +1287,14 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
 
     today = date.today().strftime("%Y-%m-%d")
 
-    # Read and base64-encode the image
     try:
         image_bytes = image_path.read_bytes()
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-        # Determine MIME type
         ext = image_path.suffix.lower()
         mime_map = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".bmp": "image/bmp",
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
         }
         mime_type = mime_map.get(ext, "image/jpeg")
     except Exception as exc:
@@ -888,16 +1310,8 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{b64_image}",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。",
-                        },
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
+                        {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据图片，提取交易数据。"},
                     ],
                 },
             ],
@@ -905,7 +1319,6 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
         )
         raw = completion.choices[0].message.content
 
-        # Extract JSON
         json_str = raw.strip()
         if "```json" in json_str:
             json_str = json_str.split("```json")[1].split("```")[0].strip()
@@ -913,14 +1326,11 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
             json_str = json_str.split("```")[1].split("```")[0].strip()
 
         data = json.loads(json_str)
-
         business_type = data.get("business_type", "other")
 
-        # For non-sales_revenue types, return classification only
         if business_type != "sales_revenue":
             return {"business_type": business_type, "transaction": None}
 
-        # For sales_revenue, parse full transaction
         if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
             return {"business_type": business_type, "transaction": None}
 
@@ -952,13 +1362,11 @@ async def _parse_image_to_transaction(image_path: Path) -> dict | None:
 
 
 def _pdf_to_images(pdf_path: Path) -> list[tuple[bytes, str]]:
-    """Convert each page of a PDF to PNG bytes. Returns list of (image_bytes, mime_type)."""
     import fitz
 
     doc = fitz.open(str(pdf_path))
     pages = []
     for page in doc:
-        # Render at 200 DPI for good OCR quality
         pix = page.get_pixmap(dpi=200)
         pages.append((pix.tobytes("png"), "image/png"))
     doc.close()
@@ -966,15 +1374,6 @@ def _pdf_to_images(pdf_path: Path) -> list[tuple[bytes, str]]:
 
 
 async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
-    """Convert PDF pages to images, then use multimodal LLM to extract transaction data.
-
-    For single-page PDFs, sends one image. For multi-page PDFs, sends all pages
-    and asks the LLM to identify the most relevant one (typically the invoice page).
-
-    Returns a dict with keys:
-      - business_type: str
-      - transaction: SalesTransaction | None
-    """
     from openai import AsyncOpenAI
     import os
     import base64
@@ -1001,7 +1400,6 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
 
     today = date.today().strftime("%Y-%m-%d")
 
-    # Build image content blocks
     image_blocks = []
     for i, (img_bytes, mime_type) in enumerate(pages):
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -1010,7 +1408,6 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
             "image_url": {"url": f"data:{mime_type};base64,{b64}"},
         })
 
-    # If multiple pages, add a note
     page_note = ""
     if len(pages) > 1:
         page_note = f"该PDF共{len(pages)}页，请识别其中包含发票/单据的页面并提取数据。"
@@ -1025,10 +1422,7 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
                     "role": "user",
                     "content": [
                         *image_blocks,
-                        {
-                            "type": "text",
-                            "text": f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}",
-                        },
+                        {"type": "text", "text": f"当前日期：{today}\n\n请识别这张发票/单据，提取交易数据。{page_note}"},
                     ],
                 },
             ],
@@ -1036,7 +1430,6 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
         )
         raw = completion.choices[0].message.content
 
-        # Extract JSON
         json_str = raw.strip()
         if "```json" in json_str:
             json_str = json_str.split("```json")[1].split("```")[0].strip()
@@ -1081,7 +1474,6 @@ async def _parse_pdf_to_transaction(pdf_path: Path) -> dict | None:
 
 # ── Serve static frontend ────────────────────────────────────────────────────
 
-# Mount static files last so API routes take priority
 app.mount("/", StaticFiles(directory=str(PROJECT_ROOT), html=True), name="static")
 
 

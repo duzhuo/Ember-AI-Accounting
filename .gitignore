@@ -6,3 +6,4 @@ data/sessions/
 data/uploads/
 data/output/
 *.sqlite3
+data/ember.db

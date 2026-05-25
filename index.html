@@ -8,25 +8,53 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=8">
-    <!-- Using Phosphor Icons for a clean, modern look -->
+    <link rel="stylesheet" href="style.css?v=9">
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
 </head>
 
 <body>
-    <div class="app-container">
+    <!-- Login Overlay -->
+    <div class="login-overlay" id="loginOverlay">
+        <div class="login-card glass-panel">
+            <div class="login-brand">
+                <div class="logo-icon"><i class="ph ph-fire"></i></div>
+                <span class="brand-name">Ember AI</span>
+            </div>
+            <h2>登录系统</h2>
+            <form id="loginForm">
+                <div class="form-field">
+                    <label for="loginUsername">用户名</label>
+                    <input type="text" id="loginUsername" placeholder="请输入用户名" autocomplete="username" required>
+                </div>
+                <div class="form-field">
+                    <label for="loginPassword">密码</label>
+                    <input type="password" id="loginPassword" placeholder="请输入密码" autocomplete="current-password" required>
+                </div>
+                <div class="login-error" id="loginError" style="display:none;"></div>
+                <button type="submit" class="btn btn-primary login-btn" id="loginSubmitBtn">
+                    登录
+                </button>
+            </form>
+            <p class="login-hint">默认管理员账号：admin / admin123</p>
+        </div>
+    </div>
+
+    <!-- Main App (hidden until login) -->
+    <div class="app-container" id="appContainer" style="display:none;">
         <!-- Left Panel: AI Assistant -->
         <aside class="sidebar glass-panel">
             <div class="sidebar-header">
                 <div class="brand">
                     <div class="logo-icon"><i class="ph ph-fire"></i></div>
-                    <span class="brand-name">Ember AI <span class="version">v1.1</span></span>
+                    <span class="brand-name">Ember AI <span class="version">v2.0</span></span>
                 </div>
-                <button class="icon-btn"><i class="ph ph-gear"></i></button>
+                <div class="sidebar-header-actions">
+                    <span class="user-badge" id="userBadge"><i class="ph ph-user-circle"></i> <span id="userDisplayName">—</span></span>
+                    <button class="icon-btn" id="logoutBtn" title="退出登录"><i class="ph ph-sign-out"></i></button>
+                </div>
             </div>
 
             <div class="chat-history" id="chatHistory">
-                <!-- Welcome Message -->
                 <div class="message ai-message">
                     <div class="avatar"><i class="ph ph-fire"></i></div>
                     <div class="content">
@@ -51,7 +79,7 @@
                         <i class="ph ph-paper-plane-right"></i>
                     </button>
                 </div>
-                <input type="file" id="fileInput" hidden multiple accept=".xlsx,.xls,.csv,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pdf">
+                <input type="file" id="fileInput" hidden multiple accept=".xlsx,.xls,.csv,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pdf,application/pdf">
             </div>
         </aside>
 
@@ -62,23 +90,26 @@
                 <button class="workspace-tab active" data-tab="voucher" id="tabVoucher">
                     <i class="ph ph-receipt"></i> 凭证
                 </button>
+                <button class="workspace-tab" data-tab="history" id="tabHistory">
+                    <i class="ph ph-clock-counter-clockwise"></i> 凭证记录
+                </button>
                 <button class="workspace-tab" data-tab="rules" id="tabRules">
                     <i class="ph ph-list-dashes"></i> 凭证规则
+                </button>
+                <button class="workspace-tab" data-tab="users" id="tabUsers" style="display:none;">
+                    <i class="ph ph-users"></i> 用户管理
                 </button>
             </div>
 
             <!-- Tab: Voucher -->
             <div class="tab-content active" id="tabContentVoucher">
-                <!-- Initial Empty State -->
                 <div id="initialState" class="empty-state-large">
                     <div class="icon-pulse"><i class="ph ph-sparkle"></i></div>
                     <h3>等待指令</h3>
                     <p>请在左侧描述业务或上传单据，AI 将为您生成凭证。</p>
                 </div>
 
-                <!-- Content Container (Hidden initially) -->
                 <div id="workspaceContent" style="display: none;">
-                    <!-- Source Data Section -->
                     <div class="section source-data-section">
                         <div class="section-header">
                             <h2>原始凭证 / 数据源</h2>
@@ -87,12 +118,9 @@
                                 <button class="icon-btn-small" id="toggleSourceData"><i class="ph ph-caret-up"></i></button>
                             </div>
                         </div>
-                        <div class="section-content" id="sourceDataContent">
-                            <!-- Items will be injected here -->
-                        </div>
+                        <div class="section-content" id="sourceDataContent"></div>
                     </div>
 
-                    <!-- Transaction Creation Section -->
                     <div class="section transaction-section">
                         <div class="section-header">
                             <h2>生成凭证</h2>
@@ -161,9 +189,7 @@
                                             <th></th>
                                         </tr>
                                     </thead>
-                                    <tbody id="voucherRows">
-                                        <!-- Rows will be injected here -->
-                                    </tbody>
+                                    <tbody id="voucherRows"></tbody>
                                     <tfoot>
                                         <tr class="total-row">
                                             <td colspan="4">合计</td>
@@ -179,6 +205,31 @@
                 </div>
             </div>
 
+            <!-- Tab: Voucher History -->
+            <div class="tab-content" id="tabContentHistory">
+                <div class="history-container" id="historyContainer">
+                    <div class="history-toolbar">
+                        <div class="history-filters">
+                            <select id="historyStatusFilter" class="history-select">
+                                <option value="">全部状态</option>
+                                <option value="draft">草稿</option>
+                                <option value="posted">已过账</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-secondary" id="refreshHistoryBtn">
+                            <i class="ph ph-arrows-clockwise"></i> 刷新
+                        </button>
+                    </div>
+                    <div class="history-loading" id="historyLoading" style="display:none;">
+                        <i class="ph ph-spinner ph-spin"></i> 加载凭证记录...
+                    </div>
+                    <div class="history-empty" id="historyEmpty" style="display:none;">
+                        <i class="ph ph-receipt"></i> 暂无凭证记录
+                    </div>
+                    <div class="history-list" id="historyList" style="display:none;"></div>
+                </div>
+            </div>
+
             <!-- Tab: Voucher Rules -->
             <div class="tab-content" id="tabContentRules">
                 <div class="rules-container" id="rulesContainer">
@@ -188,15 +239,74 @@
                     <div class="rules-empty" id="rulesEmpty" style="display:none;">
                         <i class="ph ph-warning-circle"></i> 暂无凭证规则配置
                     </div>
-                    <div class="rules-list" id="rulesList" style="display:none;">
-                        <!-- Rule cards will be injected here -->
+                    <div class="rules-list" id="rulesList" style="display:none;"></div>
+                </div>
+            </div>
+
+            <!-- Tab: User Management (admin only) -->
+            <div class="tab-content" id="tabContentUsers">
+                <div class="users-container" id="usersContainer">
+                    <div class="users-toolbar">
+                        <h2>用户管理</h2>
+                        <button class="btn btn-primary" id="addUserBtn">
+                            <i class="ph ph-plus"></i> 添加用户
+                        </button>
+                    </div>
+                    <table class="users-table" id="usersTable">
+                        <thead>
+                            <tr>
+                                <th>用户名</th>
+                                <th>显示名称</th>
+                                <th>角色</th>
+                                <th>状态</th>
+                                <th>创建时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usersTableBody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Add/Edit User Modal -->
+                <div class="modal-overlay" id="userModal" style="display:none;">
+                    <div class="modal-card glass-panel">
+                        <div class="modal-header">
+                            <h3 id="userModalTitle">添加用户</h3>
+                            <button class="icon-btn" id="closeUserModal"><i class="ph ph-x"></i></button>
+                        </div>
+                        <form id="userForm">
+                            <input type="hidden" id="editUserId">
+                            <div class="form-field">
+                                <label for="newUsername">用户名</label>
+                                <input type="text" id="newUsername" required>
+                            </div>
+                            <div class="form-field">
+                                <label for="newPassword">密码</label>
+                                <input type="password" id="newPassword">
+                            </div>
+                            <div class="form-field">
+                                <label for="newDisplayName">显示名称</label>
+                                <input type="text" id="newDisplayName" required>
+                            </div>
+                            <div class="form-field">
+                                <label for="newRole">角色</label>
+                                <select id="newRole">
+                                    <option value="user">普通用户</option>
+                                    <option value="admin">管理员</option>
+                                </select>
+                            </div>
+                            <div class="modal-actions">
+                                <button type="button" class="btn btn-secondary" id="cancelUserModal">取消</button>
+                                <button type="submit" class="btn btn-primary">保存</button>
+                            </div>
+                        </form>
                     </div>
                 </div>
             </div>
         </main>
     </div>
 
-    <script src="script.js?v=8"></script>
+    <script src="script.js?v=9"></script>
 </body>
 
 </html>
