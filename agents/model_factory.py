@@ -23,6 +23,6 @@ def create_chat_model(vision: bool = False) -> DeepSeekChatModel:
     return DeepSeekChatModel(
         credential=DeepSeekCredential(api_key=PMDE_API_KEY, base_url=PMDE_BASE_URL),
         model=PMDE_VISION_MODEL_NAME if vision else PMDE_MODEL_NAME,
-        stream=False,
+        stream=True,
         parameters=DeepSeekChatModel.Parameters(temperature=0.1),
     )

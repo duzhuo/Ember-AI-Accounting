@@ -215,13 +215,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 await processAIResponse(text);
             }
         } catch (err) {
+            // Clean up any leftover streaming message
+            const leftoverStream = document.getElementById('streaming-message');
+            if (leftoverStream) leftoverStream.remove();
             removeTypingIndicator();
             if (err.message && err.message.includes('登录已过期')) {
                 addMessage('登录已过期，请重新登录。', 'ai');
             } else {
-                addMessage('网络错误，请重试。', 'ai');
+                addMessage('请求出错：' + (err.message || '未知错误'), 'ai');
             }
-            console.error(err);
+            console.error('[sendMessage] error:', err);
         } finally {
             isProcessing = false;
         }
@@ -254,31 +257,87 @@ document.addEventListener('DOMContentLoaded', () => {
             body: JSON.stringify({ message: input, session_id: sessionId }),
         });
 
-        const data = await resp.json();
-        removeTypingIndicator();
-        sessionId = data.session_id;
+        console.log('[SSE] response status:', resp.status, 'type:', resp.type);
+        if (!resp.body) {
+            throw new Error('响应体为空 (status=' + resp.status + ')');
+        }
 
-        addMessage(data.reply, 'ai');
+        // SSE streaming
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finalData = null;
+        let errorData = null;
 
-        // Route to the correct view based on server response
-        const view = data.view;
-        if (view === 'voucher' && data.voucher) {
-            currentVoucherId = data.voucher.voucher_id;
-            activateWorkspace(data.voucher);
-            switchView('voucher');
-        } else if (view === 'rules') {
-            renderRules(data.rules || [], data.rule_mgmt?.action);
-            switchView('rules');
-            if (data.rule_mgmt) {
-                if (data.rule_mgmt.action === 'create') {
-                    openAddRuleModal(data.rule_mgmt.rule_type);
+        // Create a streaming message element
+        const streamMsg = addStreamingMessage();
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'delta') {
+                        appendStreamingText(streamMsg, data.text);
+                    } else if (data.type === 'result') {
+                        finalData = data;
+                    } else if (data.type === 'error') {
+                        errorData = data;
+                    }
+                } catch (e) {
+                    console.warn('SSE parse error:', e, line);
                 }
             }
-        } else if (view === 'voucher_list' && data.view_data) {
-            renderVoucherList(data.view_data.vouchers, data.view_data.total, data.view_data.status_filter);
+        }
+
+        // Process remaining buffer after stream ends
+        if (buffer.trim() && buffer.startsWith('data: ')) {
+            try {
+                const data = JSON.parse(buffer.slice(6));
+                if (data.type === 'result') finalData = data;
+                else if (data.type === 'error') errorData = data;
+            } catch (e) {
+                console.warn('SSE final buffer parse error:', e, buffer);
+            }
+        }
+
+        // Remove streaming message and show final result
+        finalizeStreamingMessage(streamMsg);
+
+        console.log('[SSE] stream ended. errorData:', errorData, 'finalData:', finalData);
+        if (errorData) {
+            throw new Error(errorData.reply || '服务器处理出错');
+        }
+        if (!finalData) {
+            throw new Error('未收到服务器响应，请检查网络连接');
+        }
+        sessionId = finalData.session_id;
+        addMessage(finalData.reply, 'ai');
+
+        const view = finalData.view;
+        if (view === 'voucher' && finalData.voucher) {
+            currentVoucherId = finalData.voucher.voucher_id;
+            activateWorkspace(finalData.voucher);
+            switchView('voucher');
+        } else if (view === 'rules') {
+            renderRules(finalData.rules || [], finalData.rule_mgmt?.action);
+            switchView('rules');
+            if (finalData.rule_mgmt) {
+                if (finalData.rule_mgmt.action === 'create') {
+                    openAddRuleModal(finalData.rule_mgmt.rule_type);
+                }
+            }
+        } else if (view === 'voucher_list' && finalData.view_data) {
+            renderVoucherList(finalData.view_data.vouchers, finalData.view_data.total, finalData.view_data.status_filter);
             switchView('voucher_list');
-        } else if (view === 'user_list' && data.view_data) {
-            renderUserList(data.view_data.users);
+        } else if (view === 'user_list' && finalData.view_data) {
+            renderUserList(finalData.view_data.users);
             switchView('user_list');
         }
     }
@@ -463,6 +522,41 @@ document.addEventListener('DOMContentLoaded', () => {
     function removeTypingIndicator() {
         const el = document.getElementById('typing-indicator');
         if (el) el.remove();
+    }
+
+    // ── Streaming Message ──────────────────────────────────────────────────────
+
+    function addStreamingMessage() {
+        removeTypingIndicator();
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'message ai-message';
+        msgDiv.id = 'streaming-message';
+        msgDiv.innerHTML = `
+            <div class="avatar"><i class="ph ph-fire"></i></div>
+            <div class="content"><span class="streaming-text"></span><span class="streaming-cursor">|</span></div>
+        `;
+        chatHistory.appendChild(msgDiv);
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+        return msgDiv;
+    }
+
+    function appendStreamingText(msgEl, text) {
+        const textEl = msgEl.querySelector('.streaming-text');
+        if (textEl) textEl.textContent += text;
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
+
+    function finalizeStreamingMessage(msgEl) {
+        if (!msgEl) return;
+        const textEl = msgEl.querySelector('.streaming-text');
+        const cursorEl = msgEl.querySelector('.streaming-cursor');
+        if (cursorEl) cursorEl.remove();
+        // Convert newlines to <br> for display
+        if (textEl) {
+            const raw = textEl.textContent;
+            // Don't show raw JSON to user — the final addMessage will show the real reply
+            msgEl.remove();
+        }
     }
 
     // ── Event Listeners ───────────────────────────────────────────────────────

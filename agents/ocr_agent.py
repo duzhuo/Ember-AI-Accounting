@@ -20,6 +20,7 @@ from agentscope.message import Msg, UserMsg, SystemMsg, AssistantMsg, DataBlock,
 from prompts import IMAGE_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
 
+from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
 from .model_factory import create_chat_model
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,12 @@ class OcrAgent(Agent):
             name=name,
             system_prompt=IMAGE_PARSE_SYSTEM_PROMPT,
             model=create_chat_model(vision=True),
+            middlewares=[
+                SystemPromptMiddleware(),
+                LoggingMiddleware(),
+                TimingMiddleware(),
+                TracingMiddleware(),
+            ],
         )
         self._file_path: Path = Path()
         self._file_type: str = "image"

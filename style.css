@@ -1384,3 +1384,15 @@ body {
 .btn-secondary:hover {
     background: #e5e7eb;
 }
+
+/* Streaming cursor */
+.streaming-cursor {
+    animation: blink 0.8s infinite;
+    color: #3b82f6;
+    font-weight: bold;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}

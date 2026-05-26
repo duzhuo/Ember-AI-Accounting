@@ -1,7 +1,9 @@
 """Intent recognition agent — classifies user intent and extracts structured data."""
 
+import inspect
 import json
 import logging
+import uuid
 from datetime import date
 from decimal import Decimal
 
@@ -13,35 +15,33 @@ from agentscope.event import (
     TextBlockDeltaEvent,
     TextBlockEndEvent,
 )
-from agentscope.message import Msg, AssistantMsg
-from agentscope.middleware import MiddlewareBase
+from agentscope.message import Msg, AssistantMsg, TextBlock
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
 from voucher_models import SalesTransaction
 
 from .agent_config import IDENTITY_CONTEXT, AGENT_NAME, AGENT_CAPABILITIES
+from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
 from .model_factory import create_chat_model
 
 logger = logging.getLogger(__name__)
 
 
-class _SystemPromptMiddleware(MiddlewareBase):
-    """Inject dynamic context (e.g. current date) into the system prompt."""
-
-    async def on_system_prompt(self, agent: Agent, current_prompt: str) -> str:
-        today = date.today().strftime("%Y-%m-%d")
-        return f"{current_prompt}\n\n## 当前日期\n{today}"
-
-
 class IntentAgent(Agent):
     """Classify user intent and extract business data from natural language."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, offloader=None) -> None:
         super().__init__(
             name=name,
             system_prompt=NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT,
             model=create_chat_model(),
-            middlewares=[_SystemPromptMiddleware()],
+            middlewares=[
+                SystemPromptMiddleware(),
+                LoggingMiddleware(),
+                TimingMiddleware(),
+                TracingMiddleware(),
+            ],
+            offloader=offloader,
             context_config=ContextConfig(
                 trigger_ratio=0.8,
                 reserve_ratio=0.1,
@@ -61,15 +61,60 @@ class IntentAgent(Agent):
         kwargs = await self._prepare_model_input()
         today = date.today().strftime("%Y-%m-%d")
 
+        # Stream tokens from the model
+        full_text = ""
+        block_id = uuid.uuid4().hex
+        block_started = False
+        input_tokens = 0
+        output_tokens = 0
+
         try:
-            response = await self._call_model(messages=kwargs["messages"], tools=[])
-            result_msg = AssistantMsg(name=self.name, content=list(response.content))
-            raw = result_msg.get_text_content() or ""
-            logger.info("IntentAgent raw response: %s", raw[:300])
-            parse_result = self._parse_response(raw, today)
+            res = await self._call_model(messages=kwargs["messages"], tools=[])
+
+            if inspect.isasyncgen(res):
+                async for chunk in res:
+                    if chunk.is_last:
+                        if chunk.usage:
+                            input_tokens = chunk.usage.input_tokens
+                            output_tokens = chunk.usage.output_tokens
+                        continue
+                    for block in chunk.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            if not block_started:
+                                yield TextBlockStartEvent(
+                                    reply_id=self.state.reply_id, block_id=block_id,
+                                )
+                                block_started = True
+                            full_text += block.text
+                            yield TextBlockDeltaEvent(
+                                reply_id=self.state.reply_id, block_id=block_id, delta=block.text,
+                            )
+            else:
+                for block in res.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        full_text += block.text
+                if res.usage:
+                    input_tokens = res.usage.input_tokens
+                    output_tokens = res.usage.output_tokens
+                if full_text:
+                    yield TextBlockStartEvent(reply_id=self.state.reply_id, block_id=block_id)
+                    block_started = True
+                    yield TextBlockDeltaEvent(reply_id=self.state.reply_id, block_id=block_id, delta=full_text)
+
+            logger.info("IntentAgent raw response: %s", full_text[:300])
+            parse_result = self._parse_response(full_text, today)
         except Exception as exc:
             logger.error("IntentAgent LLM call failed: %s", exc)
             parse_result = None
+
+        if block_started:
+            yield TextBlockEndEvent(reply_id=self.state.reply_id, block_id=block_id)
+
+        yield ModelCallEndEvent(
+            reply_id=self.state.reply_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
         if parse_result is None:
             parse_result = {
@@ -80,13 +125,6 @@ class IntentAgent(Agent):
             }
 
         text = json.dumps(parse_result, ensure_ascii=False, default=str)
-
-        yield ModelCallEndEvent(reply_id=self.state.reply_id, input_tokens=0, output_tokens=0)
-
-        block_id = __import__("uuid").uuid4().hex
-        yield TextBlockStartEvent(reply_id=self.state.reply_id, block_id=block_id)
-        yield TextBlockDeltaEvent(reply_id=self.state.reply_id, block_id=block_id, delta=text)
-        yield TextBlockEndEvent(reply_id=self.state.reply_id, block_id=block_id)
 
         yield AssistantMsg(
             id=self.state.reply_id,

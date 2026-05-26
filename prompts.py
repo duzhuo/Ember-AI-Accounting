@@ -211,39 +211,15 @@ IMAGE_PARSE_SYSTEM_PROMPT = """\
 # ── Voucher Generation ───────────────────────────────────────────────────────
 
 VOUCHER_GENERATION_PROMPT = """\
-你是一名专业的会计凭证生成助手。你的任务是根据提供的销售业务数据，按照中国会计准则生成对应的会计凭证草稿。
+你是一名专业的会计凭证生成助手。根据提供的业务数据，按中国会计准则生成会计凭证草稿。
 
-## 销售收入凭证规则
+## 工作流程
 
-对于销售收入(sales_revenue)业务，按产品类型生成以下分录：
-
-### 第1行 — 借：应收账款（科目代码 112200）
-- 金额 = 价税合计 (total_amount)
-- 填入 customer_code、customer_name
-- profit_center：填入
-- cost_center：不填
-- assignment：填入 contract_no
-- debit_credit = "S"
-
-### 第2行 — 贷：主营业务收入
-- 金额 = 不含税金额 (tax_excluded_amount)
-- 产品类型为 software / service / saas → 科目代码 600101，名称"主营业务收入-软件服务"
-- 产品类型为 goods → 科目代码 600102，名称"主营业务收入-商品销售"
-- 不填 customer_code、customer_name
-- tax_code：按税率确定（13%→X1, 6%→X6, 0%→X0）
-- profit_center：填入；cost_center：填入；assignment：填入 contract_no
-- debit_credit = "H"
-
-### 第3行 — 贷：应交税费-应交增值税-销项税额（科目代码 22210105）
-- 金额 = 税额 (tax_amount)
-- tax_code：按税率确定（13%→X1, 6%→X6, 0%→X0）
-- profit_center：填入；cost_center：不填；assignment：填入 contract_no
-- debit_credit = "H"
-
-### 通用规则
-- 所有行项目的 text 统一为："确认客户{customer_name}销售收入，发票{invoice_no}"
-- 借方合计必须等于贷方合计
-- 不含税金额 + 税额 = 价税合计
+1. 根据业务数据中的 business_type，调用 query_rules 工具查询对应的凭证生成规则
+2. 按规则模板中的 account_code、account_name、amount_field 等字段生成凭证分录
+3. 按规则中的 text_template 渲染行项目文本，可用字段：customer_name、invoice_no、contract_no 等
+4. tax_code_rule 为 "by_tax_rate" 时，按税率映射：13%→X1, 6%→X6, 0%→X0
+5. 借方合计必须等于贷方合计；不含税金额 + 税额 = 价税合计
 
 ## 输出格式
 

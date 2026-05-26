@@ -24,10 +24,11 @@ from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from agentscope.message import Msg, UserMsg, AssistantMsg
+from agentscope.workspace import LocalWorkspace
 from agents.agent_config import AGENT_NAME, AGENT_CAPABILITIES
 from agents.intent_agent import IntentAgent
 from agents.voucher_agent import VoucherAgent
@@ -65,7 +66,17 @@ from voucher_models import Voucher, VoucherLine
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO)
+_log_dir = Path(__file__).parent / "data" / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_dir / "ember.log", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 # ── App setup ────────────────────────────────────────────────────────────────
@@ -108,6 +119,14 @@ SUPPORTED_BUSINESS_TYPES = {
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 PDF_EXTENSIONS = {".pdf"}
+
+
+# ── SSE helpers ──────────────────────────────────────────────────────────────
+
+
+def _sse(data: dict) -> bytes:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n".encode("utf-8")
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -289,11 +308,25 @@ async def startup():
     if migrated:
         logger.info("Migrated %d rules from Excel to database", migrated)
 
+    # Shared workspace for context offloading
+    workspace = LocalWorkspace(workdir=str(Path(__file__).parent / "data" / "workspace"))
+    await workspace.initialize()
+    app.state.workspace = workspace
+    logger.info("Workspace initialized: %s", workspace.workdir)
+
     # Initialize agents
-    app.state.intent_agent = IntentAgent("intent_agent")
-    app.state.voucher_agent = VoucherAgent("voucher_agent")
+    app.state.intent_agent = IntentAgent("intent_agent", offloader=workspace)
+    app.state.voucher_agent = VoucherAgent("voucher_agent", offloader=workspace)
     app.state.ocr_agent = OcrAgent("ocr_agent")
     logger.info("Agents initialized")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    workspace = getattr(app.state, "workspace", None)
+    if workspace:
+        await workspace.close()
+        logger.info("Workspace closed")
 
 
 # ── API: Auth ─────────────────────────────────────────────────────────────────
@@ -490,12 +523,19 @@ def _format_rules_for_frontend(rules: list[dict]) -> list[dict]:
 
 
 @app.post("/api/chat")
-async def chat(payload: dict, request: Request):
+async def chat_endpoint(payload: dict, request: Request):
+    return StreamingResponse(_chat_stream(payload, request), media_type="text/event-stream")
+
+
+async def _chat_stream(payload: dict, request: Request):
     """Accept a natural language message and optional session_id, return AI response + voucher data."""
-    user = await _require_auth(request)
+    try:
+        user = await _require_auth(request)
+    except Exception:
+        yield _sse({"type": "error", "reply": "登录已过期，请重新登录。"})
+        return
     message = payload.get("message", "").strip()
     session_id = payload.get("session_id")
-
     # Session timeout: if session inactive for > SESSION_TIMEOUT_HOURS, start new session
     if session_id and await _is_session_expired(session_id):
         logger.info("Session %s expired (inactive > %dh), creating new session", session_id, SESSION_TIMEOUT_HOURS)
@@ -505,10 +545,11 @@ async def chat(payload: dict, request: Request):
     chat_session_id = session_id
 
     if not message:
-        return JSONResponse({
+        yield _sse({"type": "result", **{
             "reply": "请描述一笔业务，比如「请客户吃饭花了1200元」，或上传一张发票。",
             "session_id": session_id,
-        })
+        }})
+        return
 
     # Save user message to audit
     await save_chat_message(
@@ -570,14 +611,19 @@ async def chat(payload: dict, request: Request):
             else:
                 await app.state.intent_agent.observe(UserMsg(name="user", content=content))
         intent_msg = UserMsg(name="user", content=message)
-        intent_result_msg = await app.state.intent_agent.reply(intent_msg)
-        parse_result = intent_result_msg.metadata.get("parse_result") if intent_result_msg.metadata else None
+
+        # Streaming intent classification
+        parse_result = None
+        async for event_or_msg in app.state.intent_agent._reply(inputs=intent_msg):
+            if isinstance(event_or_msg, Msg):
+                parse_result = event_or_msg.metadata.get("parse_result") if event_or_msg.metadata else None
+            elif hasattr(event_or_msg, "delta"):
+                yield _sse({"type": "delta", "text": event_or_msg.delta})
+
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
-        return JSONResponse({
-            "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？",
-            "session_id": session_id,
-        })
+        yield _sse({"type": "result", "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？", "session_id": session_id})
+        return
 
     # Handle chat intent — direct reply, no voucher generation
     if parse_result.get("intent") == "chat":
@@ -650,10 +696,11 @@ async def chat(payload: dict, request: Request):
                 content=reply,
                 message_type="chat",
             )
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
-            })
+            }})
+            return
 
     # Handle rule_query intent — show voucher rules
     if parse_result.get("intent") == "rule_query":
@@ -684,10 +731,11 @@ async def chat(payload: dict, request: Request):
                 message_type="chat",
                 metadata={"pending_action": "rule_query"},
             )
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
-            })
+            }})
+            return
 
         # User specified a type — load from database and return matching rules
         try:
@@ -695,17 +743,19 @@ async def chat(payload: dict, request: Request):
             rules_list = _format_rules_for_frontend(rules_list)
         except Exception as exc:
             logger.error("Failed to load voucher rules: %s", exc)
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": "加载凭证规则时出错，请稍后重试。",
                 "session_id": session_id,
-            })
+            }})
+            return
 
         biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
 
         if not rules_list:
             if not reply:
                 reply = f"暂无「{biz_label}」类型的凭证规则配置。"
-            return JSONResponse({"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type})
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type}})
+            return
 
         if not reply:
             reply = f"以下是「{biz_label}」类型的凭证规则，共 {len(rules_list)} 条："
@@ -719,13 +769,14 @@ async def chat(payload: dict, request: Request):
             metadata={"rule_type": rule_type},
         )
 
-        return JSONResponse({
+        yield _sse({"type": "result", **{
             "reply": reply,
             "session_id": session_id,
             "rules": rules_list,
             "rule_type": rule_type,
             "view": "rules",
-        })
+        }})
+        return
 
     # Handle rule_mgmt intent — create/update/delete voucher rules
     if parse_result.get("intent") == "rule_mgmt":
@@ -741,7 +792,8 @@ async def chat(payload: dict, request: Request):
                 role="assistant", content=reply, message_type="chat",
                 metadata={"pending_action": "rule_mgmt", "pending_action_type": action},
             )
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
 
         biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
 
@@ -752,7 +804,8 @@ async def chat(payload: dict, request: Request):
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
             )
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
 
         if action == "create":
             if not reply:
@@ -775,12 +828,13 @@ async def chat(payload: dict, request: Request):
                 details={"rule_type": rule_type},
             )
 
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
                 "view": "rules",
                 "rule_mgmt": {"action": "create", "rule_type": rule_type},
-            })
+            }})
+            return
 
         if action in ("update", "delete"):
             try:
@@ -788,7 +842,8 @@ async def chat(payload: dict, request: Request):
                 rules_list = _format_rules_for_frontend(rules_list)
             except Exception as exc:
                 logger.error("Failed to load rules: %s", exc)
-                return JSONResponse({"reply": "加载规则失败，请重试。", "session_id": session_id})
+                yield _sse({"type": "result", **{"reply": "加载规则失败，请重试。", "session_id": session_id}})
+                return
 
             if not rules_list:
                 reply = f"暂无「{biz_label}」类型的规则可供{action}。"
@@ -796,7 +851,8 @@ async def chat(payload: dict, request: Request):
                     session_id=chat_session_id, user_id=user["id"],
                     role="assistant", content=reply, message_type="chat",
                 )
-                return JSONResponse({"reply": reply, "session_id": session_id})
+                yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+                return
 
             if not reply:
                 verb = "修改" if action == "update" else "删除"
@@ -816,13 +872,14 @@ async def chat(payload: dict, request: Request):
                 details={"rule_type": rule_type},
             )
 
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
                 "view": "rules",
                 "rules": rules_list,
                 "rule_mgmt": {"action": action, "rule_type": rule_type},
-            })
+            }})
+            return
 
     # Handle voucher_query intent — show user's voucher records
     if parse_result.get("intent") == "voucher_query":
@@ -850,12 +907,13 @@ async def chat(payload: dict, request: Request):
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
             )
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
                 "view": "voucher_list",
                 "view_data": {"vouchers": [], "total": 0, "status_filter": status_filter},
-            })
+            }})
+            return
 
         if not reply:
             reply = f"共找到 {total} 条{status_label}凭证记录："
@@ -866,12 +924,13 @@ async def chat(payload: dict, request: Request):
             metadata={"voucher_count": len(records)},
         )
 
-        return JSONResponse({
+        yield _sse({"type": "result", **{
             "reply": reply,
             "session_id": session_id,
             "view": "voucher_list",
             "view_data": {"vouchers": records, "total": total, "status_filter": status_filter},
-        })
+        }})
+        return
 
     # Handle user_mgmt intent — admin creates user via conversation
     if parse_result.get("intent") == "user_mgmt":
@@ -884,7 +943,8 @@ async def chat(payload: dict, request: Request):
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
             )
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
 
         action = parse_result.get("action", "create")
         if action == "create":
@@ -900,7 +960,8 @@ async def chat(payload: dict, request: Request):
                     session_id=chat_session_id, user_id=user["id"],
                     role="assistant", content=reply, message_type="chat",
                 )
-                return JSONResponse({"reply": reply, "session_id": session_id})
+                yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+                return
 
             # Generate default password if not provided
             if not new_password:
@@ -918,7 +979,8 @@ async def chat(payload: dict, request: Request):
                     session_id=chat_session_id, user_id=user["id"],
                     role="assistant", content=reply, message_type="chat",
                 )
-                return JSONResponse({"reply": reply, "session_id": session_id})
+                yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+                return
 
             await add_audit_log(
                 action="user.create",
@@ -945,12 +1007,13 @@ async def chat(payload: dict, request: Request):
                 u.pop("password_hash", None)
                 u.pop("password_salt", None)
 
-            return JSONResponse({
+            yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
                 "view": "user_list",
                 "view_data": {"users": users},
-            })
+            }})
+            return
 
         # Default reply for unknown user_mgmt action
         if not reply:
@@ -959,7 +1022,8 @@ async def chat(payload: dict, request: Request):
             session_id=chat_session_id, user_id=user["id"],
             role="assistant", content=reply, message_type="chat",
         )
-        return JSONResponse({"reply": reply, "session_id": session_id})
+        yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+        return
 
     business_type = parse_result["business_type"]
     txn = parse_result["transaction"]
@@ -989,16 +1053,18 @@ async def chat(payload: dict, request: Request):
             content=reply,
             message_type="chat",
         )
-        return JSONResponse({
+        yield _sse({"type": "result", **{
             "reply": reply,
             "session_id": session_id,
-        })
+        }})
+        return
 
     voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
     voucher_result = await app.state.voucher_agent.reply(voucher_msg)
     voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
     if not voucher:
-        return JSONResponse({"reply": "凭证生成失败，请重试。", "session_id": session_id})
+        yield _sse({"type": "result", **{"reply": "凭证生成失败，请重试。", "session_id": session_id}})
+        return
     session["vouchers"].append(voucher)
     _save_session(session_id, session)
 
@@ -1042,12 +1108,13 @@ async def chat(payload: dict, request: Request):
         metadata={"voucher_id": voucher.voucher_id},
     )
 
-    return JSONResponse({
+    yield _sse({"type": "result", **{
         "reply": reply,
         "session_id": session_id,
         "voucher": voucher_front,
         "view": "voucher",
-    })
+    }})
+    return
 
 
 # ── API: File Upload ─────────────────────────────────────────────────────────
