@@ -572,7 +572,7 @@ async def chat(payload: dict, request: Request):
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
         return JSONResponse({
-            "reply": "抱歉，我暂时无法理解。请尝试更具体的描述，例如「销售软件产品给XX公司，不含税金额100000元，税率13%」，或上传Excel附件。",
+            "reply": "你好！我是 Ember，你的智能记账助手。我可以帮你生成会计凭证、管理凭证规则、查询凭证记录等。有什么可以帮你的吗？",
             "session_id": session_id,
         })
 

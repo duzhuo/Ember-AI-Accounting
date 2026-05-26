@@ -57,10 +57,20 @@ class IntentAgent(AgentBase):
         try:
             response = await self.model(messages)
             raw = response.get_text_content() or ""
+            logger.info("IntentAgent raw response: %s", raw[:300])
             parse_result = self._parse_response(raw, today)
         except Exception as exc:
             logger.error("IntentAgent LLM call failed: %s", exc)
             parse_result = None
+
+        # Fallback: if parsing failed, treat as chat with a friendly reply
+        if parse_result is None:
+            parse_result = {
+                "intent": "chat",
+                "reply": "你好！我是 Ember，你的智能记账助手。我可以帮你生成会计凭证、管理凭证规则、查询凭证记录等。有什么可以帮你的吗？",
+                "business_type": None,
+                "transaction": None,
+            }
 
         result = Msg(
             name=self.name,
@@ -79,7 +89,11 @@ class IntentAgent(AgentBase):
         elif "```" in json_str:
             json_str = json_str.split("```")[1].split("```")[0].strip()
 
-        data = json.loads(json_str)
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse LLM response as JSON: %s", raw[:200])
+            return None
         intent = data.get("intent", "unknown")
 
         if intent == "chat":
