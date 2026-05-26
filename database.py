@@ -353,10 +353,16 @@ async def save_voucher_record(
     confidence: str = "",
     warnings: list | None = None,
 ) -> str:
-    """Save a voucher record to the database. Returns the record ID."""
-    record_id = str(uuid.uuid4())
+    """Save a voucher record to the database. Returns the record ID (existing if duplicate)."""
     db = await get_db()
     try:
+        # Check if voucher_id already exists
+        cursor = await db.execute("SELECT id FROM voucher_records WHERE voucher_id = ?", (voucher_id,))
+        existing = await cursor.fetchone()
+        if existing:
+            return existing["id"]
+
+        record_id = str(uuid.uuid4())
         await db.execute(
             """INSERT INTO voucher_records
                (id, voucher_id, session_id, user_id, company_code, document_type,

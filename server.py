@@ -43,6 +43,7 @@ from database import (
     delete_rule as db_delete_rule,
     delete_session,
     delete_user,
+    get_db,
     get_rule,
     get_user_by_token,
     init_db,
@@ -129,6 +130,28 @@ def _sse(data: dict) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n".encode("utf-8")
 
 
+def _extract_reply_delta(accumulated: str, last_len: int) -> str:
+    """Try to parse accumulated JSON text and extract the reply field's new portion."""
+    try:
+        # Find the reply value in the JSON
+        idx = accumulated.find('"reply"')
+        if idx < 0:
+            return ""
+        # Find the value after "reply":
+        colon = accumulated.index(":", idx + 7)
+        # Find the opening quote of the string value
+        quote_start = accumulated.index('"', colon + 1)
+        # Extract from current position to end of accumulated (the reply is still building)
+        reply_so_far = accumulated[quote_start + 1:]
+        # Unescape basic JSON escapes
+        reply_so_far = reply_so_far.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\')
+        if len(reply_so_far) > last_len:
+            return reply_so_far[last_len:]
+    except (ValueError, IndexError):
+        pass
+    return ""
+
+
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 
@@ -164,30 +187,39 @@ def _session_path(session_id: str) -> Path:
     return SESSION_DIR / f"{session_id}.json"
 
 
-def _load_session(session_id: str) -> dict[str, Any]:
+def _load_session(session_id: str, user_id: str | None = None) -> dict[str, Any] | None:
+    """Load session from disk. Returns None if session belongs to a different user."""
     path = _session_path(session_id)
     if path.exists():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+            # Reject session if it belongs to a different user
+            if user_id and raw.get("user_id") and raw["user_id"] != user_id:
+                return None
             raw["vouchers"] = [_dict_to_voucher(v) for v in raw.get("vouchers", [])]
             return raw
         except Exception:
             pass
-    return {"vouchers": [], "uploaded_files": []}
+    return {"vouchers": [], "uploaded_files": [], "user_id": user_id}
 
 
 def _save_session(session_id: str, session: dict[str, Any]) -> None:
     path = _session_path(session_id)
     data = {
+        "user_id": session.get("user_id"),
         "vouchers": [_voucher_to_json(v) for v in session.get("vouchers", [])],
         "uploaded_files": session.get("uploaded_files", []),
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
+def _get_session(session_id: str | None, user_id: str | None = None) -> tuple[str, dict[str, Any]]:
     sid = session_id or str(uuid.uuid4())
-    session = _load_session(sid)
+    session = _load_session(sid, user_id)
+    # Session belongs to a different user — create a new one
+    if session is None:
+        sid = str(uuid.uuid4())
+        session = {"vouchers": [], "uploaded_files": [], "user_id": user_id}
     return sid, session
 
 
@@ -541,7 +573,7 @@ async def _chat_stream(payload: dict, request: Request):
         logger.info("Session %s expired (inactive > %dh), creating new session", session_id, SESSION_TIMEOUT_HOURS)
         session_id = None
 
-    session_id, session = _get_session(session_id)
+    session_id, session = _get_session(session_id, user_id=user["id"])
     chat_session_id = session_id
 
     if not message:
@@ -614,11 +646,17 @@ async def _chat_stream(payload: dict, request: Request):
 
         # Streaming intent classification
         parse_result = None
+        accumulated_text = ""
+        reply_len = 0
         async for event_or_msg in app.state.intent_agent._reply(inputs=intent_msg):
             if isinstance(event_or_msg, Msg):
                 parse_result = event_or_msg.metadata.get("parse_result") if event_or_msg.metadata else None
             elif hasattr(event_or_msg, "delta"):
-                yield _sse({"type": "delta", "text": event_or_msg.delta})
+                accumulated_text += event_or_msg.delta
+                delta = _extract_reply_delta(accumulated_text, reply_len)
+                if delta:
+                    yield _sse({"type": "delta", "text": delta})
+                    reply_len += len(delta)
 
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
@@ -645,7 +683,12 @@ async def _chat_stream(payload: dict, request: Request):
                 last_meta = last_msg.get("metadata") or {}
                 pending_action_from_history = last_meta.get("pending_action")
 
-        if any(kw in msg_lower for kw in voucher_keywords):
+        # Pending action continuation: if last assistant message was asking for info, continue that flow
+        if pending_action_from_history == "user_mgmt_create":
+            parse_result = {"intent": "user_mgmt", "action": "create", "new_username": message.strip(), "new_display_name": None, "new_role": "user", "new_password": None, "reply": "", "business_type": None, "transaction": None}
+            logger.info("Pending action continuation: user_mgmt_create, username='%s'", message.strip())
+
+        elif any(kw in msg_lower for kw in voucher_keywords):
             # Override intent to voucher_query
             parse_result = {"intent": "voucher_query", "status": None, "reply": reply, "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → voucher_query for '%s'", message[:60])
@@ -959,6 +1002,7 @@ async def _chat_stream(payload: dict, request: Request):
                 await save_chat_message(
                     session_id=chat_session_id, user_id=user["id"],
                     role="assistant", content=reply, message_type="chat",
+                    metadata={"pending_action": "user_mgmt_create"},
                 )
                 yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
                 return
@@ -1127,9 +1171,26 @@ async def upload_file(
     session_id: str | None = None,
 ):
     """Upload an Excel or image file, parse it, generate vouchers via LLM."""
+    return StreamingResponse(_upload_stream(request, file, session_id), media_type="text/event-stream")
+
+
+async def _upload_stream(request: Request, file: UploadFile, session_id: str | None):
+    try:
+        async for event in _upload_file_impl(request, file, session_id):
+            yield event
+    except Exception as exc:
+        logger.error("Upload error: %s", exc, exc_info=True)
+        yield _sse({"type": "error", "reply": f"文件处理出错：{exc}"})
+
+
+async def _upload_file_impl(
+    request: Request,
+    file: UploadFile,
+    session_id: str | None,
+):
     user = await _require_auth(request)
     chat_session_id = session_id or str(uuid.uuid4())
-    session_id, session = _get_session(session_id)
+    session_id, session = _get_session(session_id, user_id=user["id"])
 
     # Save user message
     await save_chat_message(
@@ -1140,6 +1201,8 @@ async def upload_file(
         message_type="upload",
         metadata={"filename": file.filename},
     )
+
+    yield _sse({"type": "progress", "text": f"正在保存文件 {file.filename}..."})
 
     # Save uploaded file
     file_id = str(uuid.uuid4())[:8]
@@ -1158,40 +1221,35 @@ async def upload_file(
     # ── Image / PDF path: use multimodal LLM for OCR ──
     if suffix in IMAGE_EXTENSIONS or suffix in PDF_EXTENSIONS:
         file_type = "pdf" if suffix in PDF_EXTENSIONS else "image"
+        source_label = "PDF" if suffix in PDF_EXTENSIONS else "图片"
+
+        yield _sse({"type": "progress", "text": f"正在识别{source_label}内容..."})
+
         ocr_msg = UserMsg(name="user", content="", metadata={"file_path": str(saved_path), "file_type": file_type})
         ocr_result_msg = await app.state.ocr_agent.reply(ocr_msg)
         result = ocr_result_msg.metadata.get("ocr_result") if ocr_result_msg.metadata else None
 
-        source_label = "PDF" if suffix in PDF_EXTENSIONS else "图片"
-
         if result is None:
             reply = f"{source_label}识别失败，无法提取有效信息。请确保内容清晰且包含完整的发票/单据信息。"
             await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload")
-            return JSONResponse({
-                "reply": reply,
-                "session_id": session_id,
-                "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
-            })
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)}}})
+            return
 
         business_type = result.get("business_type", "other")
         if business_type not in SUPPORTED_BUSINESS_TYPES:
             supported_list = "\n".join(f"  - {desc}" for desc in SUPPORTED_BUSINESS_TYPES.values())
             type_display = {"expense": "费用报销", "asset_purchase": "资产采购", "salary": "工资薪酬", "loan": "借款/还款", "other": "其他"}.get(business_type, business_type)
             reply = f"已识别单据类型为「{type_display}」，但当前系统暂不支持该类型的凭证生成。\n\n目前支持的凭证类型：\n{supported_list}"
-            return JSONResponse({
-                "reply": reply,
-                "session_id": session_id,
-                "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
-            })
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)}}})
+            return
 
         txn = result.get("transaction")
         if txn is None:
             reply = f"{source_label}识别成功，但未能提取到完整的交易金额信息。请上传更清晰的文件。"
-            return JSONResponse({
-                "reply": reply,
-                "session_id": session_id,
-                "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
-            })
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)}}})
+            return
+
+        yield _sse({"type": "progress", "text": "正在生成凭证..."})
 
         voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
@@ -1199,7 +1257,8 @@ async def upload_file(
         if not voucher:
             reply = "凭证生成失败，请重试。"
             await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload")
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            yield _sse({"type": "error", "reply": reply})
+            return
         session["vouchers"].append(voucher)
         _save_session(session_id, session)
 
@@ -1234,29 +1293,42 @@ async def upload_file(
         reply = f"已从{source_label}中识别出1笔销售收入交易，生成了1张凭证草稿。"
         await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": voucher.voucher_id})
 
-        return JSONResponse({
+        yield _sse({"type": "result", **{
             "reply": reply,
             "session_id": session_id,
             "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             "vouchers": [voucher_front],
-        })
+        }})
+        return
 
-    # ── Excel path: original logic ──
+    # ── Excel path ──
+    yield _sse({"type": "progress", "text": "正在解析Excel文件..."})
+
     try:
         transactions = load_sales_transactions(saved_path)
     except Exception as exc:
         logger.warning("Failed to parse uploaded file: %s", exc)
-        return JSONResponse({
-            "reply": f"文件解析失败：{exc}。请确保Excel格式正确。",
-            "session_id": session_id,
-        })
+        yield _sse({"type": "error", "reply": f"文件解析失败：{exc}。请确保Excel格式正确。"})
+        return
 
     vouchers = []
-    for txn in transactions:
+    skipped = []
+    failed = []
+    total = len(transactions)
+    for idx, txn in enumerate(transactions, 1):
+        expected_voucher_id = f"VR-{txn.transaction_id}"
+        existing = await get_voucher_record(expected_voucher_id)
+        if existing:
+            skipped.append(txn)
+            continue
+
+        yield _sse({"type": "progress", "text": f"正在生成凭证 ({idx}/{total})：{txn.customer_name}..."})
+
         voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
         voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
         if not voucher:
+            failed.append(txn)
             continue
         session["vouchers"].append(voucher)
         vouchers.append(voucher)
@@ -1288,6 +1360,12 @@ async def upload_file(
     _save_session(session_id, session)
 
     reply = f"已解析 {len(transactions)} 笔交易，生成了 {len(vouchers)} 张凭证草稿。"
+    if skipped:
+        details = "、".join(f"{txn.transaction_id}({txn.customer_name})" for txn in skipped)
+        reply += f"\n跳过 {len(skipped)} 笔已存在的凭证：{details}"
+    if failed:
+        details = "、".join(f"{txn.transaction_id}({txn.customer_name})" for txn in failed)
+        reply += f"\n{len(failed)} 笔生成失败：{details}"
 
     # Export to SAP CSV
     output_path = PROJECT_ROOT / "data" / "output" / f"sap_{file_id}.csv"
@@ -1295,12 +1373,12 @@ async def upload_file(
 
     await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_count": len(vouchers)})
 
-    return JSONResponse({
+    yield _sse({"type": "result", **{
         "reply": reply,
         "session_id": session_id,
         "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
         "vouchers": [_voucher_to_front(v) for v in vouchers],
-    })
+    }})
 
 
 # ── API: Confirm Voucher ─────────────────────────────────────────────────────
@@ -1312,7 +1390,7 @@ async def confirm_voucher(payload: dict, request: Request):
     user = await _require_auth(request)
     session_id = payload.get("session_id")
     voucher_id = payload.get("voucher_id")
-    session_id, session = _get_session(session_id)
+    session_id, session = _get_session(session_id, user_id=user["id"])
 
     # Try session first, then fall back to DB
     voucher = None
@@ -1649,6 +1727,35 @@ async def api_chat_history(request: Request, limit: int = 100, offset: int = 0):
         "messages": messages,
         "limit": limit,
         "offset": offset,
+    })
+
+
+@app.get("/api/my-chat-history")
+async def api_my_chat_history(request: Request, limit: int = 50):
+    """Return the current user's most recent session messages for chat restoration."""
+    user = await _require_auth(request)
+
+    # Find the user's most recent session by latest message
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT session_id FROM chat_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user["id"],),
+        )
+        row = await cursor.fetchone()
+    finally:
+        await db.close()
+
+    if not row:
+        return JSONResponse({"session_id": None, "messages": []})
+
+    session_id = row["session_id"]
+    messages = await list_chat_messages(session_id=session_id, user_id=user["id"], limit=limit)
+    messages.reverse()  # chronological order (oldest first)
+
+    return JSONResponse({
+        "session_id": session_id,
+        "messages": messages,
     })
 
 

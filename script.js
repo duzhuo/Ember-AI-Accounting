@@ -107,6 +107,14 @@ document.addEventListener('DOMContentLoaded', () => {
             handleLogout();
             throw new Error('登录已过期，请重新登录');
         }
+        if (!resp.ok && !resp.headers.get('content-type')?.includes('text/event-stream')) {
+            let msg = `请求失败 (${resp.status})`;
+            try {
+                const err = await resp.json();
+                msg = err.error || err.detail || err.reply || msg;
+            } catch {}
+            throw new Error(msg);
+        }
         return resp;
     }
 
@@ -122,12 +130,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await resp.json();
             if (data.user) {
                 currentUser = data.user;
+                sessionId = null;
+                chatHistory.innerHTML = '';
                 showApp();
             } else {
-                showLogin();
+                handleLogout();
             }
         } catch {
-            showLogin();
+            handleLogout();
         }
     }
 
@@ -140,6 +150,30 @@ document.addEventListener('DOMContentLoaded', () => {
         loginOverlay.style.display = 'none';
         appContainer.style.display = 'grid';
         userDisplayName.textContent = currentUser.display_name || currentUser.username;
+        loadChatHistory();
+    }
+
+    async function loadChatHistory() {
+        try {
+            const resp = await apiFetch('/api/my-chat-history?limit=50');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (!data.messages || data.messages.length === 0) return;
+
+            sessionId = data.session_id;
+            for (const msg of data.messages) {
+                if (msg.role === 'user') {
+                    addMessage(msg.content, 'user');
+                } else if (msg.role === 'assistant') {
+                    // Skip metadata-only messages (like pending actions)
+                    const meta = msg.metadata || {};
+                    if (meta.pending_action) continue;
+                    addMessage(msg.content, 'ai');
+                }
+            }
+        } catch (err) {
+            console.warn('Failed to load chat history:', err);
+        }
     }
 
     loginForm.addEventListener('submit', async (e) => {
@@ -169,6 +203,9 @@ document.addEventListener('DOMContentLoaded', () => {
             authToken = data.token;
             currentUser = data.user;
             localStorage.setItem('ember_token', authToken);
+            sessionId = null;
+            chatHistory.innerHTML = '';
+            if (voucherWorkspaceContent) voucherWorkspaceContent.style.display = 'none';
             showApp();
         } catch (err) {
             loginError.textContent = '网络错误，请重试';
@@ -182,6 +219,15 @@ document.addEventListener('DOMContentLoaded', () => {
     function handleLogout() {
         authToken = null;
         currentUser = null;
+        sessionId = null;
+        currentVoucherId = null;
+        isPosted = false;
+        pendingFile = null;
+        isProcessing = false;
+        viewHistory = [];
+        currentView = 'empty';
+        chatHistory.innerHTML = '';
+        if (voucherWorkspaceContent) voucherWorkspaceContent.style.display = 'none';
         localStorage.removeItem('ember_token');
         showLogin();
     }
@@ -246,6 +292,41 @@ document.addEventListener('DOMContentLoaded', () => {
         return text.replace(/\n/g, '<br>');
     }
 
+    async function consumeSSE(resp, { onDelta, onProgress, onResult, onError }) {
+        if (!resp.body) throw new Error('响应体为空 (status=' + resp.status + ')');
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'delta') onDelta?.(data.text);
+                    else if (data.type === 'progress') onProgress?.(data.text);
+                    else if (data.type === 'result') onResult?.(data);
+                    else if (data.type === 'error') onError?.(data);
+                } catch (e) {
+                    console.warn('SSE parse error:', e, line);
+                }
+            }
+        }
+        if (buffer.trim() && buffer.startsWith('data: ')) {
+            try {
+                const data = JSON.parse(buffer.slice(6));
+                if (data.type === 'result') onResult?.(data);
+                else if (data.type === 'error') onError?.(data);
+            } catch (e) {
+                console.warn('SSE final buffer parse error:', e, buffer);
+            }
+        }
+    }
+
     function resizeTextarea() {
         userInput.style.height = 'auto';
         userInput.style.height = userInput.scrollHeight + 'px';
@@ -257,68 +338,27 @@ document.addEventListener('DOMContentLoaded', () => {
             body: JSON.stringify({ message: input, session_id: sessionId }),
         });
 
-        console.log('[SSE] response status:', resp.status, 'type:', resp.type);
-        if (!resp.body) {
-            throw new Error('响应体为空 (status=' + resp.status + ')');
-        }
-
-        // SSE streaming
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
         let finalData = null;
         let errorData = null;
-
-        // Create a streaming message element
         const streamMsg = addStreamingMessage();
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
+        await consumeSSE(resp, {
+            onDelta: (text) => appendStreamingText(streamMsg, text),
+            onResult: (data) => { finalData = data; },
+            onError: (data) => { errorData = data; },
+        });
 
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                try {
-                    const data = JSON.parse(line.slice(6));
-                    if (data.type === 'delta') {
-                        appendStreamingText(streamMsg, data.text);
-                    } else if (data.type === 'result') {
-                        finalData = data;
-                    } else if (data.type === 'error') {
-                        errorData = data;
-                    }
-                } catch (e) {
-                    console.warn('SSE parse error:', e, line);
-                }
-            }
-        }
-
-        // Process remaining buffer after stream ends
-        if (buffer.trim() && buffer.startsWith('data: ')) {
-            try {
-                const data = JSON.parse(buffer.slice(6));
-                if (data.type === 'result') finalData = data;
-                else if (data.type === 'error') errorData = data;
-            } catch (e) {
-                console.warn('SSE final buffer parse error:', e, buffer);
-            }
-        }
-
-        // Remove streaming message and show final result
-        finalizeStreamingMessage(streamMsg);
-
-        console.log('[SSE] stream ended. errorData:', errorData, 'finalData:', finalData);
         if (errorData) {
+            streamMsg.remove();
             throw new Error(errorData.reply || '服务器处理出错');
         }
         if (!finalData) {
+            streamMsg.remove();
             throw new Error('未收到服务器响应，请检查网络连接');
         }
+
         sessionId = finalData.session_id;
-        addMessage(finalData.reply, 'ai');
+        finalizeStreamingMessage(streamMsg, finalData.reply);
 
         const view = finalData.view;
         if (view === 'voucher' && finalData.voucher) {
@@ -352,24 +392,43 @@ document.addEventListener('DOMContentLoaded', () => {
             body: formData,
         });
 
-        const data = await resp.json();
-        removeTypingIndicator();
-        sessionId = data.session_id;
+        let finalData = null;
+        let errorData = null;
+        const streamMsg = addStreamingMessage();
 
-        addMessage(data.reply, 'ai');
+        await consumeSSE(resp, {
+            onProgress: (text) => {
+                const textEl = streamMsg.querySelector('.streaming-text');
+                if (textEl) textEl.textContent = text;
+            },
+            onResult: (data) => { finalData = data; },
+            onError: (data) => { errorData = data; },
+        });
 
-        if (data.file) {
-            showSourceData(data.file);
+        if (errorData) {
+            streamMsg.remove();
+            throw new Error(errorData.reply || '文件处理出错');
+        }
+        if (!finalData) {
+            streamMsg.remove();
+            throw new Error('未收到服务器响应');
         }
 
-        if (data.vouchers && data.vouchers.length > 0) {
-            const lastVoucher = data.vouchers[data.vouchers.length - 1];
+        sessionId = finalData.session_id;
+        finalizeStreamingMessage(streamMsg, finalData.reply);
+
+        if (finalData.file) {
+            showSourceData(finalData.file);
+        }
+
+        if (finalData.vouchers && finalData.vouchers.length > 0) {
+            const lastVoucher = finalData.vouchers[finalData.vouchers.length - 1];
             currentVoucherId = lastVoucher.voucher_id;
             activateWorkspace(lastVoucher);
             switchView('voucher');
 
-            if (data.vouchers.length > 1) {
-                addMessage(`共生成 ${data.vouchers.length} 张凭证，当前显示最后一张。`, 'ai');
+            if (finalData.vouchers.length > 1) {
+                addMessage(`共生成 ${finalData.vouchers.length} 张凭证，当前显示最后一张。`, 'ai');
             }
         }
     }
@@ -533,7 +592,7 @@ document.addEventListener('DOMContentLoaded', () => {
         msgDiv.id = 'streaming-message';
         msgDiv.innerHTML = `
             <div class="avatar"><i class="ph ph-fire"></i></div>
-            <div class="content"><span class="streaming-text"></span><span class="streaming-cursor">|</span></div>
+            <div class="content"><span class="streaming-text"></span><span class="streaming-cursor">▍</span></div>
         `;
         chatHistory.appendChild(msgDiv);
         chatHistory.scrollTop = chatHistory.scrollHeight;
@@ -546,17 +605,17 @@ document.addEventListener('DOMContentLoaded', () => {
         chatHistory.scrollTop = chatHistory.scrollHeight;
     }
 
-    function finalizeStreamingMessage(msgEl) {
+    function finalizeStreamingMessage(msgEl, reply) {
         if (!msgEl) return;
-        const textEl = msgEl.querySelector('.streaming-text');
         const cursorEl = msgEl.querySelector('.streaming-cursor');
         if (cursorEl) cursorEl.remove();
-        // Convert newlines to <br> for display
-        if (textEl) {
-            const raw = textEl.textContent;
-            // Don't show raw JSON to user — the final addMessage will show the real reply
-            msgEl.remove();
+        const textEl = msgEl.querySelector('.streaming-text');
+        if (textEl && reply) {
+            textEl.innerHTML = formatContent(reply);
+        } else if (textEl) {
+            textEl.innerHTML = formatContent(textEl.textContent);
         }
+        msgEl.removeAttribute('id');
     }
 
     // ── Event Listeners ───────────────────────────────────────────────────────
