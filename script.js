@@ -51,6 +51,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rules:       { title: '凭证规则',       showHeader: true, icon: 'ph-list-dashes' },
         rule_edit:   { title: '编辑规则',       showHeader: true, icon: 'ph-pencil-simple' },
         user_list:   { title: '用户管理',       showHeader: true, icon: 'ph-users' },
+        dynamic:     { title: '',              showHeader: false },
     };
 
     function switchView(viewName, options = {}) {
@@ -70,6 +71,7 @@ document.addEventListener('DOMContentLoaded', () => {
                        : viewName === 'rules' ? 'viewRules'
                        : viewName === 'rule_edit' ? 'viewRuleEdit'
                        : viewName === 'voucher' ? 'viewVoucher'
+                       : viewName === 'dynamic' ? 'viewDynamic'
                        : 'viewEmpty';
         const target = document.getElementById(targetId);
         if (target) target.classList.add('active');
@@ -332,6 +334,548 @@ document.addEventListener('DOMContentLoaded', () => {
         userInput.style.height = userInput.scrollHeight + 'px';
     }
 
+    // ── A2UI Renderer ────────────────────────────────────────────────────────
+
+    class A2UIRenderer {
+        constructor(container) {
+            this.container = container;
+            this.components = {};  // id → component definition
+            this.elements = {};    // id → DOM element
+            this.dataModel = {};   // application state
+        }
+
+        processMessages(messages) {
+            for (const msg of messages) {
+                if (msg.createSurface) this.createSurface(msg.createSurface);
+                if (msg.updateComponents) this.updateComponents(msg.updateComponents);
+                if (msg.updateDataModel) this.updateDataModel(msg.updateDataModel);
+            }
+        }
+
+        createSurface({ surfaceId, catalogId }) {
+            this.surfaceId = surfaceId;
+            this.catalogId = catalogId;
+        }
+
+        updateComponents({ surfaceId, components }) {
+            for (const comp of components) {
+                this.components[comp.id] = comp;
+            }
+            // Collect all child IDs to find top-level components
+            const childIds = new Set();
+            for (const comp of components) {
+                if (comp.children) comp.children.forEach(id => childIds.add(id));
+                if (comp.child) childIds.add(comp.child);
+            }
+            // Render all top-level components (not referenced as children)
+            this.container.innerHTML = '';
+            const topComponents = components.filter(c => !childIds.has(c.id));
+            console.log('[A2UI] Rendering', topComponents.length, 'top-level components:', topComponents.map(c => c.id));
+            for (const comp of topComponents) {
+                const el = this.renderComponent(comp);
+                if (el) this.container.appendChild(el);
+            }
+        }
+
+        updateDataModel({ path, value }) {
+            if (path === '/') {
+                Object.assign(this.dataModel, value);
+            } else {
+                const keys = path.split('/').filter(Boolean);
+                let obj = this.dataModel;
+                for (let i = 0; i < keys.length - 1; i++) {
+                    if (!obj[keys[i]]) obj[keys[i]] = {};
+                    obj = obj[keys[i]];
+                }
+                obj[keys[keys.length - 1]] = value;
+            }
+        }
+
+        resolveValue(val) {
+            if (val == null) return '';
+            if (typeof val === 'object') {
+                if (val.path) {
+                    return val.path.split('/').filter(Boolean).reduce((o, k) => o?.[k], this.dataModel) ?? '';
+                }
+                if (val.literalString) return val.literalString;
+            }
+            return val;
+        }
+
+        renderComponent(comp) {
+            const type = comp.component;
+            const renderer = this.getRenderer(type);
+            if (renderer) return renderer(comp);
+            // Unknown component: render as text fallback
+            const div = document.createElement('div');
+            div.className = 'a2ui-unknown';
+            div.textContent = `[${type}]`;
+            return div;
+        }
+
+        getRenderer(type) {
+            const map = {
+                'Text': this.renderText.bind(this),
+                'Image': this.renderImage.bind(this),
+                'Icon': this.renderIcon.bind(this),
+                'Row': this.renderRow.bind(this),
+                'Column': this.renderColumn.bind(this),
+                'List': this.renderList.bind(this),
+                'Card': this.renderCard.bind(this),
+                'Tabs': this.renderTabs.bind(this),
+                'Modal': this.renderModal.bind(this),
+                'Divider': this.renderDivider.bind(this),
+                'Button': this.renderButton.bind(this),
+                'TextField': this.renderTextField.bind(this),
+                'CheckBox': this.renderCheckBox.bind(this),
+                'ChoicePicker': this.renderChoicePicker.bind(this),
+                'Slider': this.renderSlider.bind(this),
+                'DateTimeInput': this.renderDateTimeInput.bind(this),
+                // Custom extensions
+                'DataTable': this.renderDataTable.bind(this),
+                'KeyValue': this.renderKeyValue.bind(this),
+                'FilterTabs': this.renderFilterTabs.bind(this),
+                'Badge': this.renderBadge.bind(this),
+            };
+            return map[type];
+        }
+
+        // ── Basic Catalog Renderers ──
+
+        renderText(comp) {
+            const text = this.resolveValue(comp.text);
+            const variant = comp.variant || 'body';
+            const tagMap = { h1: 'h1', h2: 'h2', h3: 'h3', h4: 'h4', h5: 'h5', caption: 'small', body: 'p' };
+            const el = document.createElement(tagMap[variant] || 'p');
+            el.className = `a2ui-text a2ui-text-${variant}`;
+            el.innerHTML = this.formatText(text);
+            return el;
+        }
+
+        formatText(text) {
+            if (!text) return '';
+            // Basic markdown: **bold**, *italic*, `code`, line breaks
+            return text
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.+?)\*/g, '<em>$1</em>')
+                .replace(/`(.+?)`/g, '<code>$1</code>')
+                .replace(/\n/g, '<br>');
+        }
+
+        renderImage(comp) {
+            const el = document.createElement('img');
+            el.className = 'a2ui-image';
+            el.src = this.resolveValue(comp.url);
+            el.alt = this.resolveValue(comp.description) || '';
+            if (comp.fit) el.style.objectFit = comp.fit;
+            return el;
+        }
+
+        renderIcon(comp) {
+            const el = document.createElement('i');
+            el.className = 'a2ui-icon ph';
+            const name = this.resolveValue(comp.name);
+            if (typeof name === 'string') el.className += ` ph-${name}`;
+            return el;
+        }
+
+        renderRow(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-row';
+            this.renderChildren(comp.children, el);
+            return el;
+        }
+
+        renderColumn(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-column';
+            this.renderChildren(comp.children, el);
+            return el;
+        }
+
+        renderList(comp) {
+            const ordered = comp.ordered || false;
+            const el = document.createElement(ordered ? 'ol' : 'ul');
+            el.className = 'a2ui-list';
+            const items = comp.items || [];
+            for (const item of items) {
+                const li = document.createElement('li');
+                if (typeof item === 'string') {
+                    li.textContent = this.resolveValue(item);
+                } else if (item.component) {
+                    li.appendChild(this.renderComponent(item));
+                } else {
+                    li.textContent = this.resolveValue(item);
+                }
+                el.appendChild(li);
+            }
+            return el;
+        }
+
+        renderCard(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-card';
+            if (comp.title) {
+                const title = document.createElement('div');
+                title.className = 'a2ui-card-title';
+                title.textContent = this.resolveValue(comp.title);
+                el.appendChild(title);
+            }
+            const body = document.createElement('div');
+            body.className = 'a2ui-card-body';
+            this.renderChildren(comp.children, body);
+            el.appendChild(body);
+            return el;
+        }
+
+        renderTabs(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-tabs';
+            const tabs = comp.tabs || [];
+            const activeTab = comp.active || '';
+            for (const tab of tabs) {
+                const btn = document.createElement('button');
+                btn.className = 'a2ui-tab' + (tab.key === activeTab ? ' active' : '');
+                btn.textContent = this.resolveValue(tab.label || tab.key);
+                btn.addEventListener('click', () => {
+                    if (comp.action) this.handleAction(comp.action, { active: tab.key });
+                });
+                el.appendChild(btn);
+            }
+            return el;
+        }
+
+        renderModal(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-modal-overlay';
+            const inner = document.createElement('div');
+            inner.className = 'a2ui-modal';
+            if (comp.title) {
+                const title = document.createElement('div');
+                title.className = 'a2ui-modal-title';
+                title.textContent = this.resolveValue(comp.title);
+                inner.appendChild(title);
+            }
+            this.renderChildren(comp.children, inner);
+            el.appendChild(inner);
+            return el;
+        }
+
+        renderDivider() {
+            return document.createElement('hr');
+        }
+
+        renderButton(comp) {
+            const el = document.createElement('button');
+            const variant = comp.variant || 'secondary';
+            el.className = `a2ui-btn a2ui-btn-${variant}`;
+            if (comp.disabled) el.disabled = true;
+            // Button text from child component
+            if (comp.child && this.components[comp.child]) {
+                el.appendChild(this.renderComponent(this.components[comp.child]));
+            }
+            el.addEventListener('click', () => {
+                if (comp.action && !el.disabled) this.handleAction(comp.action, {}, el);
+            });
+            return el;
+        }
+
+        renderTextField(comp) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'a2ui-textfield';
+            if (comp.label) {
+                const label = document.createElement('label');
+                label.textContent = this.resolveValue(comp.label);
+                wrapper.appendChild(label);
+            }
+            const input = document.createElement('input');
+            input.type = comp.inputType || 'text';
+            input.placeholder = this.resolveValue(comp.placeholder) || '';
+            if (comp.value) input.value = this.resolveValue(comp.value);
+            wrapper.appendChild(input);
+            return wrapper;
+        }
+
+        renderCheckBox(comp) {
+            const wrapper = document.createElement('label');
+            wrapper.className = 'a2ui-checkbox';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = !!comp.value;
+            wrapper.appendChild(input);
+            if (comp.label) {
+                const span = document.createElement('span');
+                span.textContent = this.resolveValue(comp.label);
+                wrapper.appendChild(span);
+            }
+            return wrapper;
+        }
+
+        renderChoicePicker(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-choice-picker';
+            const choices = comp.choices || [];
+            for (const choice of choices) {
+                const btn = document.createElement('button');
+                btn.className = 'a2ui-choice' + (choice.key === comp.value ? ' active' : '');
+                btn.textContent = this.resolveValue(choice.label || choice.key);
+                btn.addEventListener('click', () => {
+                    if (comp.action) this.handleAction(comp.action, { value: choice.key });
+                });
+                el.appendChild(btn);
+            }
+            return el;
+        }
+
+        renderSlider(comp) {
+            const el = document.createElement('input');
+            el.type = 'range';
+            el.className = 'a2ui-slider';
+            el.min = comp.min || 0;
+            el.max = comp.max || 100;
+            el.value = comp.value || 50;
+            return el;
+        }
+
+        renderDateTimeInput(comp) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'a2ui-datetime';
+            if (comp.label) {
+                const label = document.createElement('label');
+                label.textContent = this.resolveValue(comp.label);
+                wrapper.appendChild(label);
+            }
+            const input = document.createElement('input');
+            input.type = comp.enableTime ? 'datetime-local' : 'date';
+            if (comp.value) input.value = this.resolveValue(comp.value);
+            wrapper.appendChild(input);
+            return wrapper;
+        }
+
+        // ── Custom Extension Renderers ──
+
+        renderDataTable(comp) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'a2ui-table-wrapper';
+            const table = document.createElement('table');
+            table.className = 'a2ui-table';
+
+            // Header
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            for (const col of (comp.columns || [])) {
+                const th = document.createElement('th');
+                th.textContent = col.label || col.key;
+                if (col.align) th.style.textAlign = col.align;
+                headerRow.appendChild(th);
+            }
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
+            // Body
+            const tbody = document.createElement('tbody');
+            for (const row of (comp.rows || [])) {
+                const tr = document.createElement('tr');
+                for (const col of (comp.columns || [])) {
+                    const td = document.createElement('td');
+                    td.textContent = row[col.key] ?? '';
+                    if (col.align) td.style.textAlign = col.align;
+                    tr.appendChild(td);
+                }
+                // Row click action
+                if (comp.rowAction) {
+                    tr.className = 'a2ui-table-clickable';
+                    tr.addEventListener('click', () => {
+                        const action = this.resolveActionTemplate(comp.rowAction, row);
+                        this.handleAction(action);
+                    });
+                }
+                tbody.appendChild(tr);
+            }
+            table.appendChild(tbody);
+
+            // Footer
+            if (comp.footer) {
+                const tfoot = document.createElement('tfoot');
+                const footerRow = document.createElement('tr');
+                footerRow.className = 'a2ui-table-footer';
+                const values = comp.footer.values || [];
+                // First cell spans for label
+                if (comp.footer.label) {
+                    const labelTd = document.createElement('td');
+                    labelTd.textContent = comp.footer.label;
+                    labelTd.colSpan = Math.max(1, (comp.columns || []).length - values.length);
+                    footerRow.appendChild(labelTd);
+                }
+                for (const val of values) {
+                    const td = document.createElement('td');
+                    td.textContent = val;
+                    footerRow.appendChild(td);
+                }
+                tfoot.appendChild(footerRow);
+                table.appendChild(tfoot);
+            }
+
+            wrapper.appendChild(table);
+            return wrapper;
+        }
+
+        renderKeyValue(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-kv';
+            for (const pair of (comp.pairs || [])) {
+                const item = document.createElement('div');
+                item.className = 'a2ui-kv-item';
+                const label = document.createElement('label');
+                label.textContent = pair.label;
+                const value = document.createElement('div');
+                value.className = 'value';
+                value.textContent = this.resolveValue(pair.value);
+                item.appendChild(label);
+                item.appendChild(value);
+                el.appendChild(item);
+            }
+            return el;
+        }
+
+        renderFilterTabs(comp) {
+            const el = document.createElement('div');
+            el.className = 'a2ui-filter-tabs';
+            const tabs = comp.tabs || [];
+            const active = comp.active || '';
+            for (const tab of tabs) {
+                const btn = document.createElement('button');
+                btn.className = 'a2ui-filter-tab' + (tab.key === active ? ' active' : '');
+                btn.textContent = tab.label;
+                btn.addEventListener('click', () => {
+                    // Update active state visually
+                    el.querySelectorAll('.a2ui-filter-tab').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    // Fire action
+                    if (comp.action) this.handleAction(comp.action, { active: tab.key });
+                });
+                el.appendChild(btn);
+            }
+            return el;
+        }
+
+        renderBadge(comp) {
+            const el = document.createElement('span');
+            const variant = comp.variant || 'info';
+            el.className = `a2ui-badge a2ui-badge-${variant}`;
+            el.textContent = this.resolveValue(comp.text);
+            return el;
+        }
+
+        // ── Helpers ──
+
+        resolveActionTemplate(actionTemplate, rowData) {
+            // Deep clone and replace {key} placeholders with row values
+            const resolve = (val) => {
+                if (typeof val === 'string') {
+                    return val.replace(/\{(\w+)\}/g, (_, key) => rowData[key] ?? '');
+                }
+                if (Array.isArray(val)) return val.map(resolve);
+                if (val && typeof val === 'object') {
+                    const out = {};
+                    for (const [k, v] of Object.entries(val)) out[k] = resolve(v);
+                    return out;
+                }
+                return val;
+            };
+            return resolve(actionTemplate);
+        }
+
+        renderChildren(childIds, container) {
+            if (!childIds) return;
+            for (const childId of childIds) {
+                const childComp = this.components[childId];
+                if (childComp) {
+                    const el = this.renderComponent(childComp);
+                    if (el) container.appendChild(el);
+                }
+            }
+        }
+
+        handleAction(action, extraData = {}, btnEl = null) {
+            if (action?.event) {
+                const eventName = action.event.name;
+
+                // Client-side navigation: back to voucher list
+                if (eventName === 'back_to_voucher_list') {
+                    refreshVoucherList();
+                    return;
+                }
+
+                // Client-side: edit voucher — load data and render edit form
+                if (eventName === 'edit_voucher') {
+                    const voucherId = action.event.data?.voucherId;
+                    if (voucherId) loadVoucherEditForm(voucherId);
+                    return;
+                }
+
+                const payload = {
+                    event: eventName,
+                    data: { ...(action.event.data || {}), ...extraData },
+                };
+                // Disable button immediately to prevent double-click
+                if (btnEl) {
+                    btnEl.disabled = true;
+                    btnEl.dataset.origText = btnEl.textContent;
+                    btnEl.textContent = '处理中...';
+                }
+                // Show loading feedback for confirm actions
+                if (eventName === 'confirm_voucher') {
+                    addMessage('正在过账...', 'ai');
+                }
+                fetch('/api/a2ui-action', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...(authToken ? { 'Authorization': 'Bearer ' + authToken } : {}),
+                    },
+                    body: JSON.stringify(payload),
+                }).then(r => r.json()).then(data => {
+                    // Handle file picker request for attachment upload
+                    if (data.status === 'open_file_picker') {
+                        openAttachmentPicker(data.voucherId, data.accept);
+                        if (btnEl) {
+                            btnEl.disabled = false;
+                            btnEl.textContent = btnEl.dataset.origText || '上传附件';
+                        }
+                        return;
+                    }
+                    // Show server message to user
+                    if (data.message) {
+                        addMessage(data.message, 'ai');
+                    }
+                    // Re-render A2UI if returned
+                    if (data.a2ui?.messages && data.a2ui.messages.length > 0) {
+                        this.processMessages(data.a2ui.messages);
+                    } else if (data.status === 'posted' || data.status === 'already_posted') {
+                        // Mark button as done
+                        if (btnEl) {
+                            btnEl.textContent = '已过账';
+                            btnEl.classList.remove('a2ui-btn-primary');
+                            btnEl.classList.add('a2ui-btn-secondary');
+                        }
+                    }
+                }).catch(err => {
+                    console.error('A2UI action error:', err);
+                    addMessage('操作失败：' + (err.message || '网络错误'), 'ai');
+                    // Re-enable button on error
+                    if (btnEl) {
+                        btnEl.disabled = false;
+                        btnEl.textContent = btnEl.dataset.origText || '确认并记账';
+                    }
+                });
+            }
+        }
+    }
+
+    // ── Process AI Response ─────────────────────────────────────────────────
+
     async function processAIResponse(input) {
         const resp = await apiFetch('/api/chat', {
             method: 'POST',
@@ -360,6 +904,25 @@ document.addEventListener('DOMContentLoaded', () => {
         sessionId = finalData.session_id;
         finalizeStreamingMessage(streamMsg, finalData.reply);
 
+        // A2UI path: render declarative components
+        if (finalData.a2ui?.messages && finalData.a2ui.messages.length > 0) {
+            console.log('[A2UI] Received', finalData.a2ui.messages.length, 'messages');
+            const dynamicContainer = document.getElementById('viewDynamic');
+            if (dynamicContainer) {
+                try {
+                    const renderer = new A2UIRenderer(dynamicContainer);
+                    window._a2uiRenderer = renderer;
+                    renderer.processMessages(finalData.a2ui.messages);
+                    switchView('dynamic');
+                    return;
+                } catch (e) {
+                    console.error('A2UI render error, falling back to legacy view:', e);
+                    dynamicContainer.innerHTML = '';
+                }
+            }
+        }
+
+        // Fallback: legacy view routing
         const view = finalData.view;
         if (view === 'voucher' && finalData.voucher) {
             currentVoucherId = finalData.voucher.voucher_id;
@@ -421,6 +984,27 @@ document.addEventListener('DOMContentLoaded', () => {
             showSourceData(finalData.file);
         }
 
+        // A2UI path
+        if (finalData.a2ui?.messages && finalData.a2ui.messages.length > 0) {
+            const dynamicContainer = document.getElementById('viewDynamic');
+            if (dynamicContainer) {
+                try {
+                    const renderer = new A2UIRenderer(dynamicContainer);
+                    window._a2uiRenderer = renderer;
+                    renderer.processMessages(finalData.a2ui.messages);
+                    switchView('dynamic');
+                    if (finalData.vouchers && finalData.vouchers.length > 1) {
+                        addMessage(`共生成 ${finalData.vouchers.length} 张凭证，当前显示最后一张。`, 'ai');
+                    }
+                    return;
+                } catch (e) {
+                    console.error('A2UI render error, falling back to legacy view:', e);
+                    dynamicContainer.innerHTML = '';
+                }
+            }
+        }
+
+        // Fallback: legacy view
         if (finalData.vouchers && finalData.vouchers.length > 0) {
             const lastVoucher = finalData.vouchers[finalData.vouchers.length - 1];
             currentVoucherId = lastVoucher.voucher_id;
@@ -829,17 +1413,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function refreshVoucherList(status) {
-        const container = document.getElementById('voucherListContent');
-        container.innerHTML = `<div class="view-loading"><i class="ph ph-spinner ph-spin"></i> 加载中...</div>`;
-
         try {
-            const params = new URLSearchParams({ limit: '50', offset: '0' });
-            if (status) params.set('status', status);
-            const resp = await apiFetch(`/api/vouchers?${params}`);
+            const resp = await apiFetch('/api/a2ui-action', {
+                method: 'POST',
+                body: JSON.stringify({ event: 'filter_vouchers', data: { active: status || '' } }),
+            });
             const data = await resp.json();
-            renderVoucherList(data.vouchers, data.total, status);
+            if (data.a2ui?.messages) {
+                const dynamicContainer = document.getElementById('viewDynamic');
+                if (dynamicContainer) {
+                    const renderer = new A2UIRenderer(dynamicContainer);
+                    window._a2uiRenderer = renderer;
+                    renderer.processMessages(data.a2ui.messages);
+                    switchView('dynamic');
+                }
+            }
         } catch (err) {
-            container.innerHTML = `<div class="view-empty-state"><i class="ph ph-warning-circle"></i><p>加载失败</p></div>`;
+            console.error('Failed to refresh voucher list:', err);
+            addMessage('加载凭证列表失败', 'ai');
         }
     }
 
@@ -1307,6 +1898,233 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('Failed to delete rule:', err);
             alert('删除规则失败');
         }
+    }
+
+    // ── Voucher Edit Form ──────────────────────────────────────────────────────
+
+    async function loadVoucherEditForm(voucherId) {
+        try {
+            const resp = await apiFetch(`/api/vouchers/${voucherId}`);
+            const data = await resp.json();
+            if (data.error) {
+                addMessage(`加载凭证失败：${data.error}`, 'ai');
+                return;
+            }
+            renderVoucherEditForm(data.voucher, voucherId);
+        } catch (err) {
+            console.error('Failed to load voucher for editing:', err);
+            addMessage('加载凭证数据失败', 'ai');
+        }
+    }
+
+    function renderVoucherEditForm(voucher, voucherId) {
+        const container = document.getElementById('viewDynamic');
+        if (!container) return;
+
+        const rows = voucher.rows || [];
+        const headerText = voucher.header_text || '';
+        const docDate = voucher.document_date || '';
+        const postDate = voucher.posting_date || '';
+
+        let html = `
+        <div class="a2ui-voucher-edit">
+            <div class="a2ui-edit-header">
+                <button class="a2ui-btn a2ui-btn-secondary" id="editCancelBtn">← 返回</button>
+                <h2>编辑凭证 ${voucherId}</h2>
+            </div>
+            <div class="a2ui-card">
+                <div class="a2ui-card-title">凭证信息</div>
+                <div class="a2ui-edit-fields">
+                    <div class="a2ui-field">
+                        <label>凭证头文本</label>
+                        <input type="text" id="editHeaderText" value="${_escHtml(headerText)}" class="a2ui-input">
+                    </div>
+                    <div class="a2ui-field">
+                        <label>凭证日期</label>
+                        <input type="date" id="editDocDate" value="${docDate}" class="a2ui-input">
+                    </div>
+                    <div class="a2ui-field">
+                        <label>过账日期</label>
+                        <input type="date" id="editPostDate" value="${postDate}" class="a2ui-input">
+                    </div>
+                </div>
+            </div>
+            <div class="a2ui-card">
+                <div class="a2ui-card-title">凭证明细</div>
+                <div class="a2ui-table-wrapper">
+                    <table class="a2ui-table">
+                        <thead>
+                            <tr>
+                                <th>行号</th>
+                                <th>科目代码</th>
+                                <th>科目名称</th>
+                                <th>借/贷</th>
+                                <th>借方金额</th>
+                                <th>贷方金额</th>
+                                <th>摘要</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
+        rows.forEach((r, i) => {
+            const debit = r.debit || 0;
+            const credit = r.credit || 0;
+            html += `
+                            <tr>
+                                <td>${r.line_no || i + 1}</td>
+                                <td>${_escHtml(r.account_code || '')}</td>
+                                <td>${_escHtml(r.account_name || '')}</td>
+                                <td>${r.debit_credit === 'S' ? '借' : '贷'}</td>
+                                <td><input type="number" step="0.01" value="${debit}" class="a2ui-input a2ui-input-right" data-row="${i}" data-field="debit"></td>
+                                <td><input type="number" step="0.01" value="${credit}" class="a2ui-input a2ui-input-right" data-row="${i}" data-field="credit"></td>
+                                <td>${_escHtml(r.text || '')}</td>
+                            </tr>`;
+        });
+
+        html += `
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="a2ui-edit-actions">
+                <button class="a2ui-btn a2ui-btn-primary" id="editSaveBtn">保存修改</button>
+            </div>
+        </div>`;
+
+        container.innerHTML = html;
+        window._a2uiRenderer = null; // Clear renderer since we're using raw HTML
+        switchView('dynamic');
+
+        // Cancel button
+        document.getElementById('editCancelBtn').addEventListener('click', () => {
+            // Reload voucher detail
+            fetch('/api/a2ui-action', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + authToken,
+                },
+                body: JSON.stringify({ event: 'view_voucher_detail', data: { voucherId } }),
+            }).then(r => r.json()).then(data => {
+                if (data.a2ui?.messages) {
+                    const renderer = new A2UIRenderer(container);
+                    window._a2uiRenderer = renderer;
+                    renderer.processMessages(data.a2ui.messages);
+                }
+            });
+        });
+
+        // Save button
+        document.getElementById('editSaveBtn').addEventListener('click', async () => {
+            const saveBtn = document.getElementById('editSaveBtn');
+            saveBtn.disabled = true;
+            saveBtn.textContent = '保存中...';
+
+            // Collect edited values
+            const editedRows = rows.map((r, i) => {
+                const debitInput = container.querySelector(`input[data-row="${i}"][data-field="debit"]`);
+                const creditInput = container.querySelector(`input[data-row="${i}"][data-field="credit"]`);
+                return {
+                    ...r,
+                    debit: parseFloat(debitInput?.value || 0),
+                    credit: parseFloat(creditInput?.value || 0),
+                };
+            });
+
+            const totalDebit = editedRows.reduce((s, r) => s + (r.debit || 0), 0);
+            const totalCredit = editedRows.reduce((s, r) => s + (r.credit || 0), 0);
+            if (Math.abs(totalDebit - totalCredit) > 0.01) {
+                addMessage(`借贷不平衡：借方 ${totalDebit.toFixed(2)}，贷方 ${totalCredit.toFixed(2)}，请修正。`, 'ai');
+                saveBtn.disabled = false;
+                saveBtn.textContent = '保存修改';
+                return;
+            }
+
+            try {
+                const resp = await apiFetch('/api/a2ui-action', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        event: 'save_voucher_edit',
+                        data: {
+                            voucherId,
+                            voucherData: {
+                                ...voucher,
+                                header_text: document.getElementById('editHeaderText').value,
+                                document_date: document.getElementById('editDocDate').value,
+                                posting_date: document.getElementById('editPostDate').value,
+                                rows: editedRows,
+                            },
+                        },
+                    }),
+                });
+                const result = await resp.json();
+                if (result.message) addMessage(result.message, 'ai');
+                if (result.a2ui?.messages) {
+                    const renderer = new A2UIRenderer(container);
+                    window._a2uiRenderer = renderer;
+                    renderer.processMessages(result.a2ui.messages);
+                }
+            } catch (err) {
+                console.error('Save voucher edit error:', err);
+                addMessage('保存失败：' + (err.message || '网络错误'), 'ai');
+                saveBtn.disabled = false;
+                saveBtn.textContent = '保存修改';
+            }
+        });
+    }
+
+    function _escHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // ── Attachment Upload ──────────────────────────────────────────────────────
+
+    function openAttachmentPicker(voucherId, accept) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = accept || '.png,.jpg,.jpeg,.pdf,.xlsx,.xls,.csv';
+        input.onchange = async () => {
+            const file = input.files[0];
+            if (!file) return;
+            addMessage(`正在上传附件「${file.name}」...`, 'ai');
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                const resp = await fetch(`/api/vouchers/${voucherId}/attachments`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + authToken },
+                    body: formData,
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    addMessage(`上传失败：${data.error}`, 'ai');
+                    return;
+                }
+                addMessage(`附件「${file.name}」上传成功。`, 'ai');
+                // Refresh voucher detail to show new attachment
+                const a2uiRenderer = window._a2uiRenderer;
+                if (a2uiRenderer) {
+                    const refreshResp = await fetch('/api/a2ui-action', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + authToken,
+                        },
+                        body: JSON.stringify({ event: 'view_voucher_detail', data: { voucherId } }),
+                    });
+                    const refreshData = await refreshResp.json();
+                    if (refreshData.a2ui?.messages) {
+                        a2uiRenderer.processMessages(refreshData.a2ui.messages);
+                    }
+                }
+            } catch (err) {
+                console.error('Attachment upload error:', err);
+                addMessage('附件上传失败：' + (err.message || '网络错误'), 'ai');
+            }
+        };
+        input.click();
     }
 
     // ── Initialize ─────────────────────────────────────────────────────────────

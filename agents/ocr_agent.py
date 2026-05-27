@@ -1,6 +1,7 @@
 """OCR agent — extracts transaction data from invoice images and PDFs."""
 
 import base64
+import inspect
 import json
 import logging
 from datetime import date
@@ -18,7 +19,7 @@ from agentscope.event import (
 from agentscope.message import Msg, UserMsg, SystemMsg, AssistantMsg, DataBlock, TextBlock, Base64Source
 
 from prompts import IMAGE_PARSE_SYSTEM_PROMPT
-from voucher_models import SalesTransaction
+from voucher_models import SalesTransaction, ExpenseTransaction
 
 from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
 from .model_factory import create_chat_model
@@ -73,10 +74,23 @@ class OcrAgent(Agent):
         today = date.today().strftime("%Y-%m-%d")
 
         try:
-            response = await self._call_model(messages=kwargs["messages"], tools=[])
-            result_msg = AssistantMsg(name=self.name, content=list(response.content))
-            raw = result_msg.get_text_content() or ""
-            result_data = self._parse_llm_response(raw, today)
+            res = await self._call_model(messages=kwargs["messages"], tools=[])
+
+            full_text = ""
+            if inspect.isasyncgen(res):
+                async for chunk in res:
+                    if chunk.is_last:
+                        continue
+                    for block in chunk.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            full_text += block.text
+            else:
+                for block in res.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        full_text += block.text
+
+            logger.info("OcrAgent raw response: %s", full_text[:500])
+            result_data = self._parse_llm_response(full_text, today)
         except Exception as exc:
             logger.error("OcrAgent parse failed: %s", exc)
             result_data = None
@@ -105,14 +119,39 @@ class OcrAgent(Agent):
         elif "```" in json_str:
             json_str = json_str.split("```")[1].split("```")[0].strip()
 
-        data = json.loads(json_str)
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse OCR response as JSON: %s", raw[:300])
+            return None
         business_type = data.get("business_type", "other")
 
-        if business_type != "sales_revenue":
+        if business_type not in ("sales_revenue", "expense"):
             return {"business_type": business_type, "transaction": None}
 
         if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
             return {"business_type": business_type, "transaction": None}
+
+        if business_type == "expense":
+            txn = ExpenseTransaction(
+                transaction_id=data.get("transaction_id", ""),
+                company_code=data.get("company_code", "1000"),
+                document_date=data.get("document_date", today),
+                posting_date=data.get("posting_date", today),
+                vendor_code=data.get("vendor_code", "V99999"),
+                vendor_name=data.get("vendor_name", "未知商户"),
+                expense_category=data.get("expense_category", "other"),
+                receipt_no=data.get("receipt_no", ""),
+                description=data.get("description", ""),
+                currency=data.get("currency", "CNY"),
+                tax_rate=Decimal(str(data.get("tax_rate", "0.06"))),
+                tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
+                tax_amount=Decimal(str(data.get("tax_amount", "0"))),
+                total_amount=Decimal(str(data["total_amount"])),
+                profit_center=data.get("profit_center", "PC-DEFAULT"),
+                cost_center=data.get("cost_center", "CC-DEFAULT"),
+            )
+            return {"business_type": business_type, "transaction": txn}
 
         txn = SalesTransaction(
             transaction_id=data["transaction_id"],

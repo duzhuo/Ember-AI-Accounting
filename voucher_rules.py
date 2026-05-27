@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from voucher_models import SalesTransaction, Voucher, VoucherLine
+from voucher_models import SalesTransaction, ExpenseTransaction, Voucher, VoucherLine
 
 
 DEFAULT_RULE_CONFIG_PATH = Path("data/config/voucher_rules.xlsx")
@@ -134,6 +134,64 @@ DEFAULT_SALES_REVENUE_RULES = [
 ]
 
 
+DEFAULT_EXPENSE_RULES = [
+    [
+        "EXPENSE_STANDARD",
+        "expense",
+        "*",
+        "*",
+        "DR",
+        1,
+        "S",
+        "660201",
+        "管理费用-招待费",
+        "tax_excluded_amount",
+        "",
+        "by_tax_rate",
+        "profit_center",
+        "cost_center",
+        "",
+        "报销{vendor_name}费用，{description}",
+    ],
+    [
+        "EXPENSE_STANDARD",
+        "expense",
+        "*",
+        "*",
+        "DR",
+        2,
+        "S",
+        "22210101",
+        "应交税费-应交增值税-进项税额",
+        "tax_amount",
+        "",
+        "by_tax_rate",
+        "profit_center",
+        "",
+        "",
+        "报销{vendor_name}费用，{description}",
+    ],
+    [
+        "EXPENSE_STANDARD",
+        "expense",
+        "*",
+        "*",
+        "DR",
+        3,
+        "H",
+        "220201",
+        "应付账款-员工报销",
+        "total_amount",
+        "vendor",
+        "",
+        "profit_center",
+        "",
+        "",
+        "报销{vendor_name}费用，{description}",
+    ],
+]
+
+
 def money(value: Decimal) -> Decimal:
     """Round money to two decimal places."""
 
@@ -154,6 +212,8 @@ def ensure_default_rule_config(path: str | Path = DEFAULT_RULE_CONFIG_PATH) -> P
     sheet.append(RULE_HEADERS)
     for row in DEFAULT_SALES_REVENUE_RULES:
         sheet.append(row)
+    for row in DEFAULT_EXPENSE_RULES:
+        sheet.append(row)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     for cell in sheet[1]:
@@ -167,7 +227,8 @@ def ensure_default_rule_config(path: str | Path = DEFAULT_RULE_CONFIG_PATH) -> P
             38,
         )
 
-    table_ref = f"A1:P{len(DEFAULT_SALES_REVENUE_RULES) + 1}"
+    total_rules = len(DEFAULT_SALES_REVENUE_RULES) + len(DEFAULT_EXPENSE_RULES)
+    table_ref = f"A1:P{total_rules + 1}"
     table = Table(displayName="VoucherRules", ref=table_ref)
     table.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium2",
@@ -281,13 +342,71 @@ def build_sales_revenue_voucher(
     )
 
 
+def build_expense_voucher(
+    txn: ExpenseTransaction,
+    rule_config_path: str | Path = DEFAULT_RULE_CONFIG_PATH,
+    rule_lines: list[VoucherRuleLine] | None = None,
+) -> Voucher:
+    """Generate a voucher draft from configurable expense rules."""
+
+    warnings: list[str] = []
+    calculated_total = money(txn.tax_excluded_amount + txn.tax_amount)
+    if calculated_total != money(txn.total_amount):
+        warnings.append(
+            "Total amount does not equal tax excluded amount plus tax amount.",
+        )
+
+    if rule_lines is None:
+        rule_lines = load_voucher_rule_lines(rule_config_path)
+
+    matching_rules = _match_rule_lines(
+        rule_lines,
+        business_type="expense",
+        product_type="*",
+        tax_rate=txn.tax_rate,
+    )
+    if not matching_rules:
+        raise ValueError("No voucher rules matched expense transaction.")
+
+    summary = _render_template(matching_rules[0].text_template, txn)
+    lines = [
+        _build_voucher_line(rule_line, txn, summary)
+        for rule_line in sorted(matching_rules, key=lambda item: item.line_no)
+    ]
+
+    debit_total = sum(line.amount for line in lines if line.debit_credit == "S")
+    credit_total = sum(line.amount for line in lines if line.debit_credit == "H")
+    if money(debit_total) != money(credit_total):
+        warnings.append("Voucher is not balanced.")
+
+    return Voucher(
+        voucher_id=f"VR-{txn.transaction_id}",
+        company_code=txn.company_code,
+        document_type=matching_rules[0].document_type,
+        document_date=txn.document_date,
+        posting_date=txn.posting_date,
+        reference=txn.receipt_no,
+        header_text=summary,
+        source_transaction_id=txn.transaction_id,
+        confidence=Decimal("0.95") if not warnings else Decimal("0.70"),
+        warnings=warnings,
+        lines=lines,
+    )
+
+
 def _build_voucher_line(
     rule_line: VoucherRuleLine,
-    txn: SalesTransaction,
+    txn: SalesTransaction | ExpenseTransaction,
     fallback_text: str,
 ) -> VoucherLine:
-    customer_code = txn.customer_code if rule_line.customer_source == "customer" else ""
-    customer_name = txn.customer_name if rule_line.customer_source == "customer" else ""
+    customer_code = ""
+    customer_name = ""
+    if rule_line.customer_source == "customer" and hasattr(txn, "customer_code"):
+        customer_code = txn.customer_code
+        customer_name = txn.customer_name
+    elif rule_line.customer_source == "vendor" and hasattr(txn, "vendor_code"):
+        customer_code = txn.vendor_code
+        customer_name = txn.vendor_name
 
     return VoucherLine(
         line_no=rule_line.line_no,
@@ -337,7 +456,7 @@ def _matches_tax_rate(pattern: str, value: Decimal) -> bool:
     return money(Decimal(pattern) * Decimal("100")) == money(value * Decimal("100"))
 
 
-def _resolve_tax_code(rule: str, txn: SalesTransaction) -> str:
+def _resolve_tax_code(rule: str, txn: SalesTransaction | ExpenseTransaction) -> str:
     if rule == "by_tax_rate":
         rate = money(txn.tax_rate * Decimal("100"))
         if rate == Decimal("13.00"):
@@ -350,21 +469,21 @@ def _resolve_tax_code(rule: str, txn: SalesTransaction) -> str:
     return rule
 
 
-def _get_decimal_field(txn: SalesTransaction, field_name: str) -> Decimal:
+def _get_decimal_field(txn: SalesTransaction | ExpenseTransaction, field_name: str) -> Decimal:
     value = getattr(txn, field_name, None)
     if not isinstance(value, Decimal):
         raise ValueError(f"Amount field is not a Decimal field: {field_name}")
     return value
 
 
-def _get_string_field(txn: SalesTransaction, field_name: str) -> str:
+def _get_string_field(txn: SalesTransaction | ExpenseTransaction, field_name: str) -> str:
     if not field_name:
         return ""
     value = getattr(txn, field_name, "")
     return str(value or "")
 
 
-def _render_template(template: str, txn: SalesTransaction) -> str:
+def _render_template(template: str, txn: SalesTransaction | ExpenseTransaction) -> str:
     if not template:
         return ""
     allowed_fields = {field for _, field, _, _ in Formatter().parse(template) if field}

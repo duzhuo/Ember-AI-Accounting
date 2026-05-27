@@ -18,7 +18,7 @@ from agentscope.event import (
 from agentscope.message import Msg, AssistantMsg, TextBlock
 
 from prompts import NL_PARSE_SYSTEM_PROMPT
-from voucher_models import SalesTransaction
+from voucher_models import SalesTransaction, ExpenseTransaction
 
 from .agent_config import IDENTITY_CONTEXT, AGENT_NAME, AGENT_CAPABILITIES
 from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
@@ -33,7 +33,7 @@ class IntentAgent(Agent):
     def __init__(self, name: str, offloader=None) -> None:
         super().__init__(
             name=name,
-            system_prompt=NL_PARSE_SYSTEM_PROMPT + IDENTITY_CONTEXT,
+            system_prompt=NL_PARSE_SYSTEM_PROMPT,
             model=create_chat_model(),
             middlewares=[
                 SystemPromptMiddleware(),
@@ -148,63 +148,48 @@ class IntentAgent(Agent):
             return None
 
         intent = data.get("intent", "unknown")
+        reply = data.get("reply", "")
 
         if intent == "chat":
-            return {
-                "intent": "chat",
-                "reply": data.get("reply", "你好！我是 Ember，有什么可以帮你的吗？"),
-                "business_type": None,
-                "transaction": None,
-            }
+            return {"intent": "chat", "reply": reply or "你好！我是 Ember，有什么可以帮你的吗？", "business_type": None, "transaction": None}
 
         if intent == "rule_query":
-            return {
-                "intent": "rule_query",
-                "rule_type": data.get("rule_type"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
+            return {"intent": "rule_query", "rule_type": data.get("rule_type"), "reply": reply, "business_type": None, "transaction": None}
 
         if intent == "rule_mgmt":
-            return {
-                "intent": "rule_mgmt",
-                "action": data.get("action", "create"),
-                "rule_type": data.get("rule_type"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
+            return {"intent": "rule_mgmt", "action": data.get("action", "create"), "rule_type": data.get("rule_type"), "reply": reply, "business_type": None, "transaction": None}
 
         if intent == "voucher_query":
-            return {
-                "intent": "voucher_query",
-                "status": data.get("status"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
+            return {"intent": "voucher_query", "status": data.get("status"), "reply": reply, "business_type": None, "transaction": None}
 
         if intent == "user_mgmt":
-            return {
-                "intent": "user_mgmt",
-                "action": data.get("action", "create"),
-                "new_username": data.get("new_username"),
-                "new_display_name": data.get("new_display_name"),
-                "new_role": data.get("new_role", "user"),
-                "new_password": data.get("new_password"),
-                "reply": data.get("reply", ""),
-                "business_type": None,
-                "transaction": None,
-            }
+            return {"intent": "user_mgmt", "action": data.get("action", "create"), "new_username": data.get("new_username"), "new_display_name": data.get("new_display_name"), "new_role": data.get("new_role", "user"), "new_password": data.get("new_password"), "reply": reply, "business_type": None, "transaction": None}
 
         # intent == "business"
         business_type = data.get("business_type", "other")
 
-        if business_type != "sales_revenue":
-            return {"intent": "business", "business_type": business_type, "transaction": None}
+        if business_type == "expense" and data.get("tax_excluded_amount") is not None and data.get("total_amount") is not None:
+            txn = ExpenseTransaction(
+                transaction_id=data.get("transaction_id", ""),
+                company_code=data.get("company_code", "1000"),
+                document_date=data.get("document_date", today),
+                posting_date=data.get("posting_date", today),
+                vendor_code=data.get("vendor_code", "V99999"),
+                vendor_name=data.get("vendor_name", "未知商户"),
+                expense_category=data.get("expense_category", "other"),
+                receipt_no=data.get("receipt_no", ""),
+                description=data.get("description", ""),
+                currency=data.get("currency", "CNY"),
+                tax_rate=Decimal(str(data.get("tax_rate", "0.06"))),
+                tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
+                tax_amount=Decimal(str(data.get("tax_amount", "0"))),
+                total_amount=Decimal(str(data["total_amount"])),
+                profit_center=data.get("profit_center", "PC-DEFAULT"),
+                cost_center=data.get("cost_center", "CC-DEFAULT"),
+            )
+            return {"intent": "business", "business_type": business_type, "transaction": txn}
 
-        if data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
+        if business_type != "sales_revenue" or data.get("tax_excluded_amount") is None or data.get("total_amount") is None:
             return {"intent": "business", "business_type": business_type, "transaction": None}
 
         txn = SalesTransaction(

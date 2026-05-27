@@ -40,6 +40,7 @@ from database import (
     create_rule,
     create_session_token,
     create_user,
+    delete_attachment,
     delete_rule as db_delete_rule,
     delete_session,
     delete_user,
@@ -47,6 +48,7 @@ from database import (
     get_rule,
     get_user_by_token,
     init_db,
+    list_attachments,
     list_audit_logs,
     list_chat_messages,
     get_voucher_record,
@@ -55,10 +57,13 @@ from database import (
     list_voucher_records,
     mark_voucher_posted,
     migrate_rules_from_excel,
+    save_attachment,
+    seed_default_rules,
     save_chat_message,
     save_voucher_record,
     update_rule as db_update_rule,
     update_user,
+    update_voucher_record,
     count_voucher_records,
 )
 from excel_loader import load_sales_transactions
@@ -116,6 +121,7 @@ POSTED_CSV.parent.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_BUSINESS_TYPES = {
     "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
+    "expense": "费用报销（餐饮、差旅、办公等费用报销）",
 }
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -329,6 +335,245 @@ def _voucher_to_front(voucher: Voucher) -> dict:
     }
 
 
+# ── A2UI Protocol Helpers ────────────────────────────────────────────────────
+
+
+def _build_a2ui_messages(surface_id: str, components: list, data: dict | None = None) -> list:
+    """Build A2UI v0.9 protocol messages: createSurface + updateComponents + optional updateDataModel."""
+    msgs = [{"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": "ember"}}]
+    msgs.append({"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}})
+    if data:
+        msgs.append({"version": "v0.9", "updateDataModel": {"surfaceId": surface_id, "path": "/", "value": data}})
+    return msgs
+
+
+def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = True, attachments: list | None = None) -> dict:
+    """Convert voucher frontend dict to A2UI messages."""
+    rows = voucher_front.get("rows", [])
+    header_pairs = [
+        {"label": "凭证号", "value": voucher_front.get("voucher_id", "—")},
+        {"label": "公司代码", "value": voucher_front.get("company_code", "—")},
+        {"label": "凭证类型", "value": voucher_front.get("document_type", "—")},
+        {"label": "凭证日期", "value": voucher_front.get("document_date", "—")},
+        {"label": "过账日期", "value": voucher_front.get("posting_date", "—")},
+        {"label": "参考", "value": voucher_front.get("reference", "—")},
+        {"label": "凭证头文本", "value": voucher_front.get("header_text", "—")},
+        {"label": "置信度", "value": voucher_front.get("confidence", "—")},
+    ]
+
+    table_columns = [
+        {"key": "line_no", "label": "行号"},
+        {"key": "account_code", "label": "科目代码"},
+        {"key": "account_name", "label": "科目名称"},
+        {"key": "debit_credit", "label": "借/贷"},
+        {"key": "debit", "label": "借方金额", "align": "right"},
+        {"key": "credit", "label": "贷方金额", "align": "right"},
+        {"key": "currency", "label": "币种"},
+        {"key": "text", "label": "摘要"},
+    ]
+    table_rows = []
+    for r in rows:
+        table_rows.append({
+            "line_no": str(r.get("line_no", "")),
+            "account_code": r.get("account_code", ""),
+            "account_name": r.get("account_name", ""),
+            "debit_credit": "借" if r.get("debit_credit") == "S" else "贷",
+            "debit": f"{r.get('debit', 0):,.2f}" if r.get("debit") else "",
+            "credit": f"{r.get('credit', 0):,.2f}" if r.get("credit") else "",
+            "currency": r.get("currency", "CNY"),
+            "text": r.get("text", ""),
+        })
+
+    total_debit = sum(r.get("debit", 0) for r in rows)
+    total_credit = sum(r.get("credit", 0) for r in rows)
+
+    warnings = voucher_front.get("warnings", [])
+    warning_components = []
+    if warnings:
+        warning_components.append({
+            "id": "warnings", "component": "Text",
+            "text": "⚠️ " + "；".join(warnings), "variant": "caption",
+        })
+
+    status = voucher_front.get("status", "draft")
+    is_posted = status == "posted"
+
+    components = [
+        {"id": "back-btn", "component": "Button", "child": "back-text",
+         "variant": "secondary", "action": {"event": {"name": "back_to_voucher_list"}}},
+        {"id": "back-text", "component": "Text", "text": "← 返回列表"},
+        {"id": "title", "component": "Text", "text": f"凭证 {voucher_id}", "variant": "h2"},
+        {"id": "info-card", "component": "Card", "title": "凭证信息", "children": ["kv-info"]},
+        {"id": "kv-info", "component": "KeyValue", "pairs": header_pairs},
+        *warning_components,
+        {"id": "rows-card", "component": "Card", "title": "凭证明细", "children": ["rows-table"]},
+        {"id": "rows-table", "component": "DataTable",
+         "columns": table_columns, "rows": table_rows,
+         "footer": {"label": "合计", "values": ["", "", "", "",
+                      f"{total_debit:,.2f}", f"{total_credit:,.2f}", "", ""]}},
+    ]
+    # Attachments section
+    att_list = attachments or []
+    att_table_rows = []
+    for att in att_list:
+        size_kb = round(att.get("file_size", 0) / 1024, 1)
+        att_table_rows.append({
+            "id": att.get("id", ""),
+            "filename": att.get("filename", ""),
+            "size": f"{size_kb} KB",
+            "uploaded_by_name": att.get("uploaded_by_name", ""),
+            "created_at": att.get("created_at", ""),
+        })
+
+    att_columns = [
+        {"key": "filename", "label": "文件名"},
+        {"key": "size", "label": "大小"},
+        {"key": "uploaded_by_name", "label": "上传人"},
+        {"key": "created_at", "label": "上传时间"},
+    ]
+
+    components.append(
+        {"id": "attach-card", "component": "Card", "title": f"附件（{len(att_list)} 份）", "children": ["attach-table", "attach-btn-row"]},
+    )
+    components.append(
+        {"id": "attach-table", "component": "DataTable",
+         "columns": att_columns, "rows": att_table_rows},
+    )
+    components.append(
+        {"id": "attach-btn-row", "component": "Row", "children": ["upload-attach-btn"]},
+    )
+    components.append(
+        {"id": "upload-attach-btn", "component": "Button", "child": "upload-attach-text",
+         "variant": "secondary",
+         "action": {"event": {"name": "upload_attachment", "data": {"voucherId": voucher_id}}}},
+    )
+    components.append(
+        {"id": "upload-attach-text", "component": "Text", "text": "上传附件"},
+    )
+
+    if show_actions:
+        components.extend([
+            {"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn"]},
+            {"id": "confirm-btn", "component": "Button", "child": "confirm-text",
+             "variant": "primary", "disabled": is_posted,
+             "action": {"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}}},
+            {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else "确认并记账"},
+            {"id": "edit-btn", "component": "Button", "child": "edit-text",
+             "variant": "secondary", "disabled": is_posted,
+             "action": {"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}}},
+            {"id": "edit-text", "component": "Text", "text": "编辑凭证"},
+        ])
+    return _build_a2ui_messages("voucher-detail", components)
+
+
+def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None) -> dict:
+    """Convert voucher records list to A2UI messages."""
+    status_label = {"draft": "草稿", "posted": "已过账"}.get(status_filter, "全部")
+
+    tabs = [
+        {"key": "", "label": "全部"},
+        {"key": "draft", "label": "草稿"},
+        {"key": "posted", "label": "已过账"},
+    ]
+
+    table_columns = [
+        {"key": "voucher_id", "label": "凭证号"},
+        {"key": "document_type", "label": "类型"},
+        {"key": "document_date", "label": "日期"},
+        {"key": "header_text", "label": "摘要"},
+        {"key": "status", "label": "状态"},
+        {"key": "created_at", "label": "创建时间"},
+    ]
+    table_rows = []
+    for rec in records:
+        status_text = "已过账" if rec.get("status") == "posted" else "草稿"
+        table_rows.append({
+            "voucher_id": rec.get("voucher_id", ""),
+            "document_type": rec.get("document_type", ""),
+            "document_date": rec.get("document_date", ""),
+            "header_text": rec.get("header_text", ""),
+            "status": status_text,
+            "created_at": rec.get("created_at", ""),
+        })
+
+    components = [
+        {"id": "title", "component": "Text", "text": f"凭证列表 — {status_label}（共 {total} 条）", "variant": "h2"},
+        {"id": "filter-tabs", "component": "FilterTabs",
+         "tabs": tabs, "active": status_filter or "",
+         "action": {"event": {"name": "filter_vouchers"}}},
+        {"id": "voucher-table", "component": "DataTable",
+         "columns": table_columns, "rows": table_rows,
+         "rowAction": {"event": {"name": "view_voucher_detail", "data": {"voucherId": "{voucher_id}"}}}},
+    ]
+    return _build_a2ui_messages("voucher-list", components)
+
+
+def _rules_to_a2ui(rules_list: list, rule_type: str, rule_mgmt: dict | None = None) -> dict:
+    """Convert rules list to A2UI messages."""
+    biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
+
+    table_columns = [
+        {"key": "rule_code", "label": "规则编码"},
+        {"key": "business_type", "label": "业务类型"},
+        {"key": "product_type", "label": "产品类型"},
+        {"key": "tax_rate", "label": "税率"},
+        {"key": "document_type", "label": "凭证类型"},
+        {"key": "line_count", "label": "分录行数"},
+    ]
+    table_rows = []
+    for rule in rules_list:
+        table_rows.append({
+            "rule_code": rule.get("rule_code", ""),
+            "business_type": rule.get("business_type", ""),
+            "product_type": rule.get("product_type", ""),
+            "tax_rate": str(rule.get("tax_rate", "")),
+            "document_type": rule.get("document_type", ""),
+            "line_count": str(len(rule.get("lines", []))),
+        })
+
+    action_buttons = []
+    if rule_mgmt and rule_mgmt.get("action") == "create":
+        action_buttons.append({
+            "id": "add-rule-btn", "component": "Button", "child": "add-rule-text",
+            "variant": "primary",
+            "action": {"event": {"name": "create_rule", "data": {"ruleType": rule_type}}}},
+        )
+        action_buttons.append({"id": "add-rule-text", "component": "Text", "text": "新增规则"})
+
+    components = [
+        {"id": "title", "component": "Text", "text": f"凭证规则 — {biz_label}（共 {len(rules_list)} 条）", "variant": "h2"},
+        {"id": "rules-table", "component": "DataTable",
+         "columns": table_columns, "rows": table_rows},
+        *action_buttons,
+    ]
+    return _build_a2ui_messages("rules", components)
+
+
+def _users_to_a2ui(users: list) -> dict:
+    """Convert users list to A2UI messages."""
+    table_columns = [
+        {"key": "username", "label": "用户名"},
+        {"key": "display_name", "label": "显示名称"},
+        {"key": "role", "label": "角色"},
+        {"key": "created_at", "label": "创建时间"},
+    ]
+    table_rows = []
+    for u in users:
+        table_rows.append({
+            "username": u.get("username", ""),
+            "display_name": u.get("display_name", ""),
+            "role": "管理员" if u.get("role") == "admin" else "普通用户",
+            "created_at": u.get("created_at", ""),
+        })
+
+    components = [
+        {"id": "title", "component": "Text", "text": f"用户管理（共 {len(users)} 人）", "variant": "h2"},
+        {"id": "users-table", "component": "DataTable",
+         "columns": table_columns, "rows": table_rows},
+    ]
+    return _build_a2ui_messages("users", components)
+
+
 # ── Startup event ────────────────────────────────────────────────────────────
 
 
@@ -339,6 +584,9 @@ async def startup():
     migrated = await migrate_rules_from_excel()
     if migrated:
         logger.info("Migrated %d rules from Excel to database", migrated)
+    seeded = await seed_default_rules()
+    if seeded:
+        logger.info("Seeded %d default rules", seeded)
 
     # Shared workspace for context offloading
     workspace = LocalWorkspace(workdir=str(Path(__file__).parent / "data" / "workspace"))
@@ -648,20 +896,24 @@ async def _chat_stream(payload: dict, request: Request):
         parse_result = None
         accumulated_text = ""
         reply_len = 0
-        async for event_or_msg in app.state.intent_agent._reply(inputs=intent_msg):
-            if isinstance(event_or_msg, Msg):
-                parse_result = event_or_msg.metadata.get("parse_result") if event_or_msg.metadata else None
-            elif hasattr(event_or_msg, "delta"):
-                accumulated_text += event_or_msg.delta
-                delta = _extract_reply_delta(accumulated_text, reply_len)
-                if delta:
-                    yield _sse({"type": "delta", "text": delta})
-                    reply_len += len(delta)
+        try:
+            async for event_or_msg in app.state.intent_agent._reply(inputs=intent_msg):
+                if isinstance(event_or_msg, Msg):
+                    parse_result = event_or_msg.metadata.get("parse_result") if event_or_msg.metadata else None
+                elif hasattr(event_or_msg, "delta"):
+                    accumulated_text += event_or_msg.delta
+                    delta = _extract_reply_delta(accumulated_text, reply_len)
+                    if delta:
+                        yield _sse({"type": "delta", "text": delta})
+                        reply_len += len(delta)
+        except Exception as llm_exc:
+            logger.error("LLM call failed: %s", llm_exc)
+            parse_result = None  # Will trigger keyword fallback below
 
     logger.info("NL parse result for '%s': %s", message[:60], parse_result)
     if parse_result is None:
-        yield _sse({"type": "result", "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？", "session_id": session_id})
-        return
+        # LLM failed — try keyword fallback before giving up
+        parse_result = {"intent": "chat", "reply": f"你好！我是 {AGENT_NAME}，{AGENT_CAPABILITIES.replace('、', '、')}。有什么可以帮你的吗？", "business_type": None, "transaction": None}
 
     # Handle chat intent — direct reply, no voucher generation
     if parse_result.get("intent") == "chat":
@@ -797,7 +1049,7 @@ async def _chat_stream(payload: dict, request: Request):
         if not rules_list:
             if not reply:
                 reply = f"暂无「{biz_label}」类型的凭证规则配置。"
-            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type}})
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type, "a2ui": {"messages": _rules_to_a2ui([], rule_type)}}})
             return
 
         if not reply:
@@ -818,6 +1070,7 @@ async def _chat_stream(payload: dict, request: Request):
             "rules": rules_list,
             "rule_type": rule_type,
             "view": "rules",
+            "a2ui": {"messages": _rules_to_a2ui(rules_list, rule_type)},
         }})
         return
 
@@ -876,6 +1129,7 @@ async def _chat_stream(payload: dict, request: Request):
                 "session_id": session_id,
                 "view": "rules",
                 "rule_mgmt": {"action": "create", "rule_type": rule_type},
+                "a2ui": {"messages": _rules_to_a2ui([], rule_type, {"action": "create", "rule_type": rule_type})},
             }})
             return
 
@@ -921,59 +1175,71 @@ async def _chat_stream(payload: dict, request: Request):
                 "view": "rules",
                 "rules": rules_list,
                 "rule_mgmt": {"action": action, "rule_type": rule_type},
+                "a2ui": {"messages": _rules_to_a2ui(rules_list, rule_type, {"action": action, "rule_type": rule_type})},
             }})
             return
 
     # Handle voucher_query intent — show user's voucher records
     if parse_result.get("intent") == "voucher_query":
-        status_filter = parse_result.get("status")
-        reply = parse_result.get("reply", "")
+        try:
+            status_filter = parse_result.get("status")
+            reply = parse_result.get("reply", "")
 
-        # Regular users see only their own; admins see all
-        user_id = None if user["role"] == "admin" else user["id"]
-        records = await list_voucher_records(user_id=user_id, status=status_filter, limit=50, offset=0)
-        total = await count_voucher_records(user_id=user_id, status=status_filter)
+            # Regular users see only their own; admins see all
+            user_id = None if user["role"] == "admin" else user["id"]
+            records = await list_voucher_records(user_id=user_id, status=status_filter, limit=50, offset=0)
+            total = await count_voucher_records(user_id=user_id, status=status_filter)
+            logger.info("voucher_query: user=%s status=%s records=%d total=%d", user["username"], status_filter, len(records), total)
 
-        await add_audit_log(
-            action="voucher.query",
-            user_id=user["id"],
-            username=user["username"],
-            target_type="voucher",
-            details={"status_filter": status_filter, "result_count": len(records)},
-        )
+            await add_audit_log(
+                action="voucher.query",
+                user_id=user["id"],
+                username=user["username"],
+                target_type="voucher",
+                details={"status_filter": status_filter, "result_count": len(records)},
+            )
 
-        status_label = {"draft": "草稿", "posted": "已过账"}.get(status_filter, "全部")
-        if not records:
+            status_label = {"draft": "草稿", "posted": "已过账"}.get(status_filter, "全部")
+            if not records:
+                if not reply:
+                    reply = f"暂无{status_label}状态的凭证记录。"
+                await save_chat_message(
+                    session_id=chat_session_id, user_id=user["id"],
+                    role="assistant", content=reply, message_type="chat",
+                )
+                yield _sse({"type": "result", **{
+                    "reply": reply,
+                    "session_id": session_id,
+                    "view": "voucher_list",
+                    "view_data": {"vouchers": [], "total": 0, "status_filter": status_filter},
+                    "a2ui": {"messages": _voucher_list_to_a2ui([], 0, status_filter)},
+                }})
+                return
+
             if not reply:
-                reply = f"暂无{status_label}状态的凭证记录。"
+                reply = f"共找到 {total} 条{status_label}凭证记录："
+
             await save_chat_message(
                 session_id=chat_session_id, user_id=user["id"],
                 role="assistant", content=reply, message_type="chat",
+                metadata={"voucher_count": len(records)},
             )
+
+            a2ui_msgs = _voucher_list_to_a2ui(records, total, status_filter)
+            logger.info("voucher_query: a2ui messages generated, count=%d", len(a2ui_msgs))
+
             yield _sse({"type": "result", **{
                 "reply": reply,
                 "session_id": session_id,
                 "view": "voucher_list",
-                "view_data": {"vouchers": [], "total": 0, "status_filter": status_filter},
+                "view_data": {"vouchers": records, "total": total, "status_filter": status_filter},
+                "a2ui": {"messages": a2ui_msgs},
             }})
             return
-
-        if not reply:
-            reply = f"共找到 {total} 条{status_label}凭证记录："
-
-        await save_chat_message(
-            session_id=chat_session_id, user_id=user["id"],
-            role="assistant", content=reply, message_type="chat",
-            metadata={"voucher_count": len(records)},
-        )
-
-        yield _sse({"type": "result", **{
-            "reply": reply,
-            "session_id": session_id,
-            "view": "voucher_list",
-            "view_data": {"vouchers": records, "total": total, "status_filter": status_filter},
-        }})
-        return
+        except Exception as exc:
+            logger.error("voucher_query error: %s", exc, exc_info=True)
+            yield _sse({"type": "result", "reply": f"查询凭证时出错：{exc}", "session_id": session_id})
+            return
 
     # Handle user_mgmt intent — admin creates user via conversation
     if parse_result.get("intent") == "user_mgmt":
@@ -1056,6 +1322,7 @@ async def _chat_stream(payload: dict, request: Request):
                 "session_id": session_id,
                 "view": "user_list",
                 "view_data": {"users": users},
+                "a2ui": {"messages": _users_to_a2ui(users)},
             }})
             return
 
@@ -1103,7 +1370,7 @@ async def _chat_stream(payload: dict, request: Request):
         }})
         return
 
-    voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+    voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn, "business_type": business_type})
     voucher_result = await app.state.voucher_agent.reply(voucher_msg)
     voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
     if not voucher:
@@ -1157,6 +1424,7 @@ async def _chat_stream(payload: dict, request: Request):
         "session_id": session_id,
         "voucher": voucher_front,
         "view": "voucher",
+        "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher.voucher_id)},
     }})
     return
 
@@ -1251,7 +1519,7 @@ async def _upload_file_impl(
 
         yield _sse({"type": "progress", "text": "正在生成凭证..."})
 
-        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn, "business_type": business_type})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
         voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
         if not voucher:
@@ -1277,6 +1545,14 @@ async def _upload_file_impl(
             confidence=str(voucher.confidence),
             warnings=voucher.warnings,
         )
+        await save_attachment(
+            voucher_id=voucher.voucher_id,
+            filename=file.filename or f"{file_id}{suffix}",
+            file_path=str(saved_path),
+            file_size=file_info["size"],
+            content_type=file.content_type or "",
+            uploaded_by=user["id"],
+        )
         await add_audit_log(
             action="voucher.generate",
             user_id=user["id"],
@@ -1290,14 +1566,17 @@ async def _upload_file_impl(
         output_path = PROJECT_ROOT / "data" / "output" / f"sap_{file_id}.csv"
         export_sap_csv([voucher], output_path)
 
-        reply = f"已从{source_label}中识别出1笔销售收入交易，生成了1张凭证草稿。"
+        biz_label = BIZ_TYPE_LABELS.get(business_type, business_type)
+        reply = f"已从{source_label}中识别出1笔{biz_label}交易，生成了1张凭证草稿。"
         await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": voucher.voucher_id})
 
+        attachments = await list_attachments(voucher.voucher_id)
         yield _sse({"type": "result", **{
             "reply": reply,
             "session_id": session_id,
             "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             "vouchers": [voucher_front],
+            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_front["voucher_id"], attachments=attachments)},
         }})
         return
 
@@ -1324,7 +1603,7 @@ async def _upload_file_impl(
 
         yield _sse({"type": "progress", "text": f"正在生成凭证 ({idx}/{total})：{txn.customer_name}..."})
 
-        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn})
+        voucher_msg = UserMsg(name="user", content=json.dumps(asdict(txn), ensure_ascii=False, default=str), metadata={"transaction": txn, "business_type": "sales_revenue"})
         voucher_result = await app.state.voucher_agent.reply(voucher_msg)
         voucher = voucher_result.metadata.get("voucher") if voucher_result.metadata else None
         if not voucher:
@@ -1373,12 +1652,144 @@ async def _upload_file_impl(
 
     await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_count": len(vouchers)})
 
+    voucher_fronts = [_voucher_to_front(v) for v in vouchers]
+    last_voucher_front = voucher_fronts[-1] if voucher_fronts else {}
+    last_voucher_id = vouchers[-1].voucher_id if vouchers else ""
     yield _sse({"type": "result", **{
         "reply": reply,
         "session_id": session_id,
         "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
-        "vouchers": [_voucher_to_front(v) for v in vouchers],
+        "vouchers": voucher_fronts,
+        "a2ui": {"messages": _voucher_to_a2ui(last_voucher_front, last_voucher_id)} if voucher_fronts else {},
     }})
+
+
+# ── API: A2UI Action ─────────────────────────────────────────────────────────
+
+
+@app.post("/api/a2ui-action")
+async def handle_a2ui_action(request: Request):
+    """Handle A2UI component action events from the frontend."""
+    user = await _require_auth(request)
+    body = await request.json()
+    event_name = body.get("event", "")
+    event_data = body.get("data", {})
+
+    logger.info("A2UI action: event=%s data=%s user=%s", event_name, event_data, user["username"])
+
+    # Route by event name
+    if event_name == "confirm_voucher":
+        voucher_id = event_data.get("voucherId", "")
+        if not voucher_id:
+            return JSONResponse({"status": "error", "message": "缺少凭证ID"})
+        # Check current status
+        db_record = await get_voucher_record(voucher_id)
+        if not db_record:
+            return JSONResponse({"status": "error", "message": f"凭证 {voucher_id} 不存在"})
+        if db_record.get("status") == "posted":
+            return JSONResponse({"status": "already_posted", "message": f"凭证 {voucher_id} 已经过账", "a2ui": {"messages": []}})
+        # Post the voucher
+        _append_posted_csv_from_record(db_record)
+        await mark_voucher_posted(voucher_id, user["id"])
+        await add_audit_log(
+            action="voucher.post", user_id=user["id"], username=user["username"],
+            target_type="voucher", target_id=voucher_id, details={"source": "a2ui_action"},
+        )
+        logger.info("Voucher %s posted via A2UI action by %s", voucher_id, user["username"])
+        return JSONResponse({
+            "status": "posted",
+            "message": f"凭证 {voucher_id} 已成功过账",
+            "a2ui": {"messages": []},
+        })
+
+    if event_name == "filter_vouchers":
+        # Return filtered voucher list as A2UI messages
+        status_filter = event_data.get("active", "")
+        user_id = None if user["role"] == "admin" else user["id"]
+        records = await list_voucher_records(user_id=user_id, status=status_filter or None, limit=50, offset=0)
+        total = await count_voucher_records(user_id=user_id, status=status_filter or None)
+        return JSONResponse({
+            "status": "ok",
+            "a2ui": {"messages": _voucher_list_to_a2ui(records, total, status_filter or None)},
+        })
+
+    if event_name == "create_rule":
+        rule_type = event_data.get("ruleType", "")
+        return JSONResponse({
+            "status": "ok",
+            "message": f"创建规则: {rule_type}",
+            "a2ui": {"messages": _rules_to_a2ui([], rule_type, {"action": "create", "rule_type": rule_type})},
+        })
+
+    if event_name in ("view_voucher_detail", "edit_voucher"):
+        voucher_id = event_data.get("voucherId", "")
+        db_record = await get_voucher_record(voucher_id)
+        if not db_record:
+            return JSONResponse({"status": "error", "message": f"凭证 {voucher_id} 不存在"})
+        voucher_front = json.loads(db_record.get("voucher_data") or "{}")
+        voucher_front["status"] = db_record.get("status", "draft")
+        show_actions = event_name == "edit_voucher"
+        attachments = await list_attachments(voucher_id)
+        return JSONResponse({
+            "status": "ok",
+            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_id, show_actions=show_actions, attachments=attachments)},
+        })
+
+    if event_name == "upload_attachment":
+        voucher_id = event_data.get("voucherId", "")
+        return JSONResponse({
+            "status": "open_file_picker",
+            "voucherId": voucher_id,
+            "accept": ".png,.jpg,.jpeg,.gif,.webp,.bmp,.pdf,.xlsx,.xls,.csv",
+        })
+
+    if event_name == "save_voucher_edit":
+        voucher_id = event_data.get("voucherId", "")
+        voucher_data = event_data.get("voucherData", {})
+        if not voucher_id:
+            return JSONResponse({"status": "error", "message": "缺少凭证ID"})
+
+        record = await get_voucher_record(voucher_id)
+        if not record:
+            return JSONResponse({"status": "error", "message": f"凭证 {voucher_id} 不存在"})
+        if record.get("status") == "posted":
+            return JSONResponse({"status": "error", "message": "已过账凭证不可编辑"})
+
+        rows = voucher_data.get("rows", [])
+        total_debit = sum(r.get("debit", 0) for r in rows)
+        total_credit = sum(r.get("credit", 0) for r in rows)
+        if abs(total_debit - total_credit) > 0.01:
+            return JSONResponse({"status": "error", "message": f"借贷不平衡：借方 {total_debit:.2f}，贷方 {total_credit:.2f}"})
+
+        updated = await update_voucher_record(
+            voucher_id,
+            voucher_data=voucher_data,
+            header_text=voucher_data.get("header_text", ""),
+            document_date=voucher_data.get("document_date", ""),
+            posting_date=voucher_data.get("posting_date", ""),
+        )
+        if not updated:
+            return JSONResponse({"status": "error", "message": "更新失败"})
+
+        await add_audit_log(
+            action="voucher.edit",
+            user_id=user["id"],
+            username=user["username"],
+            target_type="voucher",
+            target_id=voucher_id,
+        )
+
+        # Return refreshed voucher detail
+        voucher_front = json.loads(record.get("voucher_data") or "{}")
+        voucher_front["status"] = record.get("status", "draft")
+        attachments = await list_attachments(voucher_id)
+        return JSONResponse({
+            "status": "ok",
+            "message": f"凭证 {voucher_id} 已更新",
+            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_id, show_actions=True, attachments=attachments)},
+        })
+
+    return JSONResponse({"status": "unknown_event", "message": f"未处理的事件: {event_name}"})
 
 
 # ── API: Confirm Voucher ─────────────────────────────────────────────────────
@@ -1699,6 +2110,47 @@ async def api_get_voucher(voucher_id: str, request: Request):
     return JSONResponse({"voucher": voucher_data})
 
 
+@app.put("/api/vouchers/{voucher_id}")
+async def api_update_voucher(voucher_id: str, payload: dict, request: Request):
+    """Update a voucher record (only draft vouchers can be edited)."""
+    user = await _require_auth(request)
+
+    record = await get_voucher_record(voucher_id)
+    if not record:
+        return JSONResponse({"error": "凭证不存在"}, status_code=404)
+    if record.get("status") == "posted":
+        return JSONResponse({"error": "已过账的凭证不可编辑"}, status_code=400)
+
+    voucher_data = payload.get("voucher_data", {})
+    rows = voucher_data.get("rows", [])
+
+    # Validate debit/credit balance
+    total_debit = sum(r.get("debit", 0) for r in rows)
+    total_credit = sum(r.get("credit", 0) for r in rows)
+    if abs(total_debit - total_credit) > 0.01:
+        return JSONResponse({"error": f"借贷不平衡：借方 {total_debit:.2f}，贷方 {total_credit:.2f}"}, status_code=400)
+
+    updated = await update_voucher_record(
+        voucher_id,
+        voucher_data=voucher_data,
+        header_text=voucher_data.get("header_text", record.get("header_text", "")),
+        document_date=voucher_data.get("document_date", record.get("document_date", "")),
+        posting_date=voucher_data.get("posting_date", record.get("posting_date", "")),
+    )
+    if not updated:
+        return JSONResponse({"error": "更新失败"}, status_code=500)
+
+    await add_audit_log(
+        action="voucher.edit",
+        user_id=user["id"],
+        username=user["username"],
+        target_type="voucher",
+        target_id=voucher_id,
+    )
+
+    return JSONResponse({"status": "ok", "message": f"凭证 {voucher_id} 已更新"})
+
+
 # ── API: Audit Logs (admin only) ─────────────────────────────────────────────
 
 
@@ -1757,6 +2209,80 @@ async def api_my_chat_history(request: Request, limit: int = 50):
         "session_id": session_id,
         "messages": messages,
     })
+
+
+# ── API: Attachments ─────────────────────────────────────────────────────────
+
+
+@app.get("/api/vouchers/{voucher_id}/attachments")
+async def api_list_attachments(voucher_id: str, request: Request):
+    """List attachments for a voucher."""
+    user = await _require_auth(request)
+    attachments = await list_attachments(voucher_id)
+    return JSONResponse({"attachments": attachments})
+
+
+@app.post("/api/vouchers/{voucher_id}/attachments")
+async def api_upload_attachment(voucher_id: str, request: Request, file: UploadFile = File(...)):
+    """Upload a file as an attachment to a voucher."""
+    user = await _require_auth(request)
+
+    # Verify voucher exists
+    db_record = await get_voucher_record(voucher_id)
+    if not db_record:
+        return JSONResponse({"error": "凭证不存在"}, status_code=404)
+
+    # Save file to disk
+    file_id = str(uuid.uuid4())[:8]
+    suffix = Path(file.filename or "upload").suffix.lower()
+    saved_path = UPLOAD_DIR / f"{file_id}{suffix}"
+    with saved_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    file_size = saved_path.stat().st_size
+    content_type = file.content_type or ""
+
+    att_id = await save_attachment(
+        voucher_id=voucher_id,
+        filename=file.filename or f"{file_id}{suffix}",
+        file_path=str(saved_path),
+        file_size=file_size,
+        content_type=content_type,
+        uploaded_by=user["id"],
+    )
+
+    await add_audit_log(
+        action="attachment.upload",
+        user_id=user["id"],
+        username=user["username"],
+        target_type="attachment",
+        target_id=att_id,
+        details={"voucher_id": voucher_id, "filename": file.filename},
+    )
+
+    return JSONResponse({
+        "status": "ok",
+        "attachment_id": att_id,
+        "filename": file.filename,
+        "file_size": file_size,
+    })
+
+
+@app.delete("/api/attachments/{attachment_id}")
+async def api_delete_attachment(attachment_id: str, request: Request):
+    """Delete an attachment."""
+    user = await _require_auth(request)
+    deleted = await delete_attachment(attachment_id)
+    if not deleted:
+        return JSONResponse({"error": "附件不存在"}, status_code=404)
+    await add_audit_log(
+        action="attachment.delete",
+        user_id=user["id"],
+        username=user["username"],
+        target_type="attachment",
+        target_id=attachment_id,
+    )
+    return JSONResponse({"status": "ok"})
 
 
 # ── Serve static frontend ────────────────────────────────────────────────────

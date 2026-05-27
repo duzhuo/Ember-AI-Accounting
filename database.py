@@ -148,6 +148,21 @@ CREATE TABLE IF NOT EXISTS voucher_rule_lines (
 CREATE INDEX IF NOT EXISTS idx_voucher_rules_code ON voucher_rules(rule_code);
 CREATE INDEX IF NOT EXISTS idx_voucher_rules_business ON voucher_rules(business_type);
 CREATE INDEX IF NOT EXISTS idx_voucher_rule_lines_rule ON voucher_rule_lines(rule_id);
+
+CREATE TABLE IF NOT EXISTS voucher_attachments (
+    id TEXT PRIMARY KEY,
+    voucher_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    content_type TEXT NOT NULL DEFAULT '',
+    uploaded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (voucher_id) REFERENCES voucher_records(voucher_id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_voucher_attachments_voucher ON voucher_attachments(voucher_id);
 """
 
 
@@ -381,6 +396,34 @@ async def save_voucher_record(
         )
         await db.commit()
         return record_id
+    finally:
+        await db.close()
+
+
+async def update_voucher_record(voucher_id: str, voucher_data: dict, **kwargs) -> bool:
+    """Update a voucher record (only draft status allowed). Returns True if updated."""
+    allowed = {"company_code", "document_type", "document_date", "posting_date", "reference", "header_text", "confidence", "warnings"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    fields["voucher_data"] = json.dumps(voucher_data, ensure_ascii=False)
+
+    db = await get_db()
+    try:
+        # Only allow editing draft vouchers
+        cursor = await db.execute("SELECT status FROM voucher_records WHERE voucher_id = ?", (voucher_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return False
+        if row["status"] != "draft":
+            return False
+
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [voucher_id]
+        cursor = await db.execute(
+            f"UPDATE voucher_records SET {set_clause} WHERE voucher_id = ?",
+            values,
+        )
+        await db.commit()
+        return cursor.rowcount > 0
     finally:
         await db.close()
 
@@ -830,3 +873,111 @@ async def migrate_rules_from_excel() -> int:
         logger.info("Migrated rule %s from Excel to database", rule_code)
 
     return len(grouped)
+
+
+async def seed_default_rules() -> int:
+    """Seed default rules (expense, etc.) into database if not present. Returns count seeded."""
+    from voucher_rules import DEFAULT_EXPENSE_RULES
+
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT rule_code FROM voucher_rules")
+        existing = {row["rule_code"] for row in await cursor.fetchall()}
+    finally:
+        await db.close()
+
+    # Group DEFAULT_EXPENSE_RULES by rule_code
+    grouped: dict[str, dict] = {}
+    for row in DEFAULT_EXPENSE_RULES:
+        rule_code = row[0]
+        if rule_code in existing:
+            continue
+        if rule_code not in grouped:
+            grouped[rule_code] = {
+                "business_type": row[1],
+                "product_type": row[2],
+                "tax_rate": row[3],
+                "document_type": row[4],
+                "lines": [],
+            }
+        grouped[rule_code]["lines"].append({
+            "line_no": row[5],
+            "debit_credit": row[6],
+            "account_code": row[7],
+            "account_name": row[8],
+            "amount_field": row[9],
+            "customer_source": row[10],
+            "tax_code_rule": row[11],
+            "profit_center_source": row[12],
+            "cost_center_source": row[13],
+            "assignment_source": row[14],
+            "text_template": row[15],
+        })
+
+    for rule_code, data in grouped.items():
+        await create_rule(
+            rule_code=rule_code,
+            business_type=data["business_type"],
+            product_type=data["product_type"],
+            tax_rate=data["tax_rate"],
+            document_type=data["document_type"],
+            lines=data["lines"],
+        )
+        logger.info("Seeded default rule: %s", rule_code)
+
+    return len(grouped)
+
+
+# ── Attachment operations ────────────────────────────────────────────────────
+
+
+async def save_attachment(
+    voucher_id: str,
+    filename: str,
+    file_path: str,
+    file_size: int,
+    content_type: str,
+    uploaded_by: str,
+) -> str:
+    """Save an attachment record. Returns the attachment ID."""
+    att_id = str(uuid.uuid4())
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO voucher_attachments (id, voucher_id, filename, file_path, file_size, content_type, uploaded_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (att_id, voucher_id, filename, file_path, file_size, content_type, uploaded_by, datetime.now().isoformat()),
+        )
+        await db.commit()
+        return att_id
+    finally:
+        await db.close()
+
+
+async def list_attachments(voucher_id: str) -> list[dict]:
+    """List all attachments for a voucher."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT va.*, u.display_name as uploaded_by_name
+               FROM voucher_attachments va
+               LEFT JOIN users u ON va.uploaded_by = u.id
+               WHERE va.voucher_id = ?
+               ORDER BY va.created_at DESC""",
+            (voucher_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def delete_attachment(attachment_id: str) -> bool:
+    """Delete an attachment record. Returns True if deleted."""
+    db = await get_db()
+    try:
+        cursor = await db.execute("DELETE FROM voucher_attachments WHERE id = ?", (attachment_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()

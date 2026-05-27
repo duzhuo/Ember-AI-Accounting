@@ -27,6 +27,28 @@ class SalesTransaction:
 
 
 @dataclass(frozen=True)
+class ExpenseTransaction:
+    """A normalized expense / reimbursement business record."""
+
+    transaction_id: str
+    company_code: str
+    document_date: str
+    posting_date: str
+    vendor_code: str
+    vendor_name: str
+    expense_category: str
+    receipt_no: str
+    description: str
+    currency: str
+    tax_rate: Decimal
+    tax_excluded_amount: Decimal
+    tax_amount: Decimal
+    total_amount: Decimal
+    profit_center: str
+    cost_center: str
+
+
+@dataclass(frozen=True)
 class VoucherLine:
     """One debit or credit line in a voucher."""
 

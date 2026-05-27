@@ -12,8 +12,8 @@ from agentscope.state import AgentState
 from agentscope.tool import FunctionTool, Toolkit
 
 from prompts import VOUCHER_GENERATION_PROMPT
-from voucher_models import SalesTransaction, Voucher, VoucherLine
-from voucher_rules import build_sales_revenue_voucher
+from voucher_models import SalesTransaction, ExpenseTransaction, Voucher, VoucherLine
+from voucher_rules import build_sales_revenue_voucher, build_expense_voucher
 from database import list_rules
 
 from .middleware import SystemPromptMiddleware, LoggingMiddleware, TimingMiddleware, TracingMiddleware
@@ -68,7 +68,7 @@ class VoucherAgent(Agent):
         voucher = _parse_llm_response(raw, txn)
         if voucher is None:
             logger.warning("LLM voucher parsing failed, falling back to rule engine.")
-            voucher = build_sales_revenue_voucher(txn)
+            voucher = _build_fallback_voucher(txn)
 
         voucher_dict = _voucher_to_dict(voucher)
         text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
@@ -98,7 +98,7 @@ class VoucherAgent(Agent):
             voucher = _parse_llm_response(raw, txn)
             if voucher is None:
                 logger.warning("LLM voucher parsing failed, falling back to rule engine.")
-                voucher = build_sales_revenue_voucher(txn)
+                voucher = _build_fallback_voucher(txn)
             voucher_dict = _voucher_to_dict(voucher)
             text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
             yield AssistantMsg(
@@ -108,28 +108,60 @@ class VoucherAgent(Agent):
                 metadata={"status": "generated", "voucher": voucher},
             )
 
-    def _extract_transaction(self, msg: Msg) -> SalesTransaction:
-        """Extract SalesTransaction from message content or metadata."""
+    def _extract_transaction(self, msg: Msg) -> SalesTransaction | ExpenseTransaction:
+        """Extract transaction from message content or metadata."""
         if msg.metadata and "transaction" in msg.metadata:
             return msg.metadata["transaction"]
 
         data = json.loads(msg.get_text_content() or "{}")
-        return _dict_to_transaction(data)
+        business_type = msg.metadata.get("business_type", "") if msg.metadata else ""
+        if business_type == "expense" or "vendor_name" in data:
+            return _dict_to_expense_transaction(data)
+        return _dict_to_sales_transaction(data)
 
 
-def _build_user_prompt(txn: SalesTransaction) -> str:
+def _build_fallback_voucher(txn: SalesTransaction | ExpenseTransaction) -> Voucher:
+    """Build voucher using rule engine based on transaction type."""
+    if isinstance(txn, ExpenseTransaction):
+        return build_expense_voucher(txn)
+    return build_sales_revenue_voucher(txn)
+
+
+def _build_user_prompt(txn: SalesTransaction | ExpenseTransaction) -> str:
     txn_dict = asdict(txn)
     for key, value in txn_dict.items():
         if isinstance(value, Decimal):
             txn_dict[key] = str(value)
 
+    label = "费用报销" if isinstance(txn, ExpenseTransaction) else "销售业务"
     return (
-        "请根据以下销售业务数据生成会计凭证草稿：\n\n"
+        f"请根据以下{label}数据生成会计凭证草稿：\n\n"
         f"```json\n{json.dumps(txn_dict, ensure_ascii=False, indent=2)}\n```"
     )
 
 
-def _dict_to_transaction(data: dict) -> SalesTransaction:
+def _dict_to_expense_transaction(data: dict) -> ExpenseTransaction:
+    return ExpenseTransaction(
+        transaction_id=data.get("transaction_id", ""),
+        company_code=data.get("company_code", "1000"),
+        document_date=data.get("document_date", ""),
+        posting_date=data.get("posting_date", ""),
+        vendor_code=data.get("vendor_code", "V99999"),
+        vendor_name=data.get("vendor_name", "未知商户"),
+        expense_category=data.get("expense_category", "other"),
+        receipt_no=data.get("receipt_no", ""),
+        description=data.get("description", ""),
+        currency=data.get("currency", "CNY"),
+        tax_rate=Decimal(str(data.get("tax_rate", "0.06"))),
+        tax_excluded_amount=Decimal(str(data["tax_excluded_amount"])),
+        tax_amount=Decimal(str(data.get("tax_amount", "0"))),
+        total_amount=Decimal(str(data["total_amount"])),
+        profit_center=data.get("profit_center", "PC-DEFAULT"),
+        cost_center=data.get("cost_center", "CC-DEFAULT"),
+    )
+
+
+def _dict_to_sales_transaction(data: dict) -> SalesTransaction:
     return SalesTransaction(
         transaction_id=data["transaction_id"],
         company_code=data.get("company_code", "1000"),
@@ -150,7 +182,7 @@ def _dict_to_transaction(data: dict) -> SalesTransaction:
     )
 
 
-def _parse_llm_response(raw: str, txn: SalesTransaction) -> Voucher | None:
+def _parse_llm_response(raw: str, txn: SalesTransaction | ExpenseTransaction) -> Voucher | None:
     """Parse LLM JSON response into a Voucher object. Returns None on failure."""
     json_str = _extract_json(raw)
 
@@ -197,13 +229,15 @@ def _parse_llm_response(raw: str, txn: SalesTransaction) -> Voucher | None:
     if warnings and confidence > Decimal("0.70"):
         confidence = Decimal("0.70")
 
+    reference = txn.receipt_no if isinstance(txn, ExpenseTransaction) else txn.invoice_no
+
     return Voucher(
         voucher_id=f"VR-{txn.transaction_id}",
         company_code=txn.company_code,
         document_type="DR",
         document_date=txn.document_date,
         posting_date=txn.posting_date,
-        reference=txn.invoice_no,
+        reference=reference,
         header_text=data.get("header_text", ""),
         source_transaction_id=txn.transaction_id,
         confidence=confidence,
