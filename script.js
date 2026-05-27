@@ -1904,13 +1904,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function loadVoucherEditForm(voucherId) {
         try {
-            const resp = await apiFetch(`/api/vouchers/${voucherId}`);
+            const resp = await fetch('/api/a2ui-action', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(authToken ? { 'Authorization': 'Bearer ' + authToken } : {}),
+                },
+                body: JSON.stringify({ event: 'edit_voucher', data: { voucherId } }),
+            });
             const data = await resp.json();
-            if (data.error) {
-                addMessage(`加载凭证失败：${data.error}`, 'ai');
+            if (data.status === 'error') {
+                addMessage(`加载凭证失败：${data.message}`, 'ai');
                 return;
             }
-            renderVoucherEditForm(data.voucher, voucherId);
+            renderVoucherEditForm(data.voucher || data, voucherId);
         } catch (err) {
             console.error('Failed to load voucher for editing:', err);
             addMessage('加载凭证数据失败', 'ai');
@@ -2059,6 +2066,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
                 const result = await resp.json();
                 if (result.message) addMessage(result.message, 'ai');
+                if (result.status === 'error') {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '保存修改';
+                    return;
+                }
                 if (result.a2ui?.messages) {
                     const renderer = new A2UIRenderer(container);
                     window._a2uiRenderer = renderer;

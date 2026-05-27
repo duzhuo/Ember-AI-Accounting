@@ -508,9 +508,9 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None) 
     return _build_a2ui_messages("voucher-list", components)
 
 
-def _rules_to_a2ui(rules_list: list, rule_type: str, rule_mgmt: dict | None = None) -> dict:
+def _rules_to_a2ui(rules_list: list, rule_type: str | None, rule_mgmt: dict | None = None) -> dict:
     """Convert rules list to A2UI messages."""
-    biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
+    biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type) if rule_type else "全部"
 
     table_columns = [
         {"key": "rule_code", "label": "规则编码"},
@@ -543,10 +543,63 @@ def _rules_to_a2ui(rules_list: list, rule_type: str, rule_mgmt: dict | None = No
     components = [
         {"id": "title", "component": "Text", "text": f"凭证规则 — {biz_label}（共 {len(rules_list)} 条）", "variant": "h2"},
         {"id": "rules-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows},
+         "columns": table_columns, "rows": table_rows,
+         "rowAction": {"event": {"name": "view_rule_detail", "data": {"ruleCode": "{rule_code}"}}}},
         *action_buttons,
     ]
     return _build_a2ui_messages("rules", components)
+
+
+def _rule_detail_to_a2ui(rule: dict) -> dict:
+    """Convert a single rule with lines to A2UI detail view."""
+    biz_label = BIZ_TYPE_LABELS.get(rule.get("business_type"), rule.get("business_type", ""))
+    components = [
+        {"id": "detail-title", "component": "Text",
+         "text": f"规则详情 — {rule.get('rule_code', '')}", "variant": "h2"},
+        {"id": "detail-info", "component": "Card", "children": ["info-biz", "info-prod", "info-tax", "info-doc"],
+         "title": "基本信息"},
+        {"id": "info-biz", "component": "Text", "text": f"业务类型：{biz_label}"},
+        {"id": "info-prod", "component": "Text", "text": f"产品类型：{rule.get('product_type', '-')}"},
+        {"id": "info-tax", "component": "Text", "text": f"税率：{rule.get('tax_rate', '-')}"},
+        {"id": "info-doc", "component": "Text", "text": f"凭证类型：{rule.get('document_type', '-')}"},
+        {"id": "lines-title", "component": "Text", "text": "分录行", "variant": "h3"},
+    ]
+
+    lines = rule.get("lines", [])
+    if lines:
+        line_columns = [
+            {"key": "line_no", "label": "行号"},
+            {"key": "debit_credit", "label": "借贷"},
+            {"key": "account_code", "label": "科目编码"},
+            {"key": "account_name", "label": "科目名称"},
+            {"key": "amount_field", "label": "金额字段"},
+            {"key": "tax_code_rule", "label": "税码规则"},
+        ]
+        line_rows = []
+        for line in lines:
+            line_rows.append({
+                "line_no": str(line.get("line_no", "")),
+                "debit_credit": "借" if line.get("debit_credit") == "S" else "贷",
+                "account_code": line.get("account_code", ""),
+                "account_name": line.get("account_name", ""),
+                "amount_field": line.get("amount_field", ""),
+                "tax_code_rule": line.get("tax_code_rule", ""),
+            })
+        components.append({
+            "id": "lines-table", "component": "DataTable",
+            "columns": line_columns, "rows": line_rows,
+        })
+    else:
+        components.append({"id": "no-lines", "component": "Text", "text": "暂无分录行"})
+
+    components.append({
+        "id": "back-btn", "component": "Button", "child": "back-btn-text",
+        "variant": "secondary",
+        "action": {"event": {"name": "back_to_rules", "data": {}}},
+    })
+    components.append({"id": "back-btn-text", "component": "Text", "text": "返回规则列表"})
+
+    return _build_a2ui_messages("rule_detail", components)
 
 
 def _users_to_a2ui(users: list) -> dict:
@@ -859,9 +912,14 @@ async def _chat_stream(payload: dict, request: Request):
     }
 
     if recent_history:
-        last_msg = recent_history[0]  # most recent message (desc order)
-        if last_msg["role"] == "assistant":
-            last_meta = last_msg.get("metadata") or {}
+        # Find the most recent assistant message (skip user messages)
+        last_assistant_msg = None
+        for m in recent_history:
+            if m["role"] == "assistant":
+                last_assistant_msg = m
+                break
+        if last_assistant_msg:
+            last_meta = last_assistant_msg.get("metadata") or {}
             pending = last_meta.get("pending_action")
             if pending in ("rule_mgmt", "rule_query"):
                 pending_type = last_meta.get("pending_action_type", "create")
@@ -871,11 +929,14 @@ async def _chat_stream(payload: dict, request: Request):
                     if kw in msg_lower_for_pending:
                         detected_type = biz_type
                         break
-                if detected_type:
+                # "都看"/"全部"/"所有" → show all rules
+                all_keywords = ["都看", "全部", "所有", "都要", "全看", "都查", "全部查看"]
+                is_all = any(kw in msg_lower_for_pending for kw in all_keywords)
+                if detected_type or (is_all and pending == "rule_query"):
                     parse_result = {
                         "intent": pending,
                         "action": pending_type if pending == "rule_mgmt" else None,
-                        "rule_type": detected_type,
+                        "rule_type": detected_type,  # None means show all
                         "reply": "",
                         "business_type": None,
                         "transaction": None,
@@ -1010,29 +1071,8 @@ async def _chat_stream(payload: dict, request: Request):
             details={"rule_type": rule_type},
         )
 
-        if rule_type is None:
-            available_types = {
-                "sales_revenue": "销售收入",
-            }
-            type_list = "\n".join(f"  {i+1}. {desc}" for i, desc in enumerate(available_types.values()))
-            if not reply:
-                reply = f"目前系统支持以下凭证类型的规则查看：\n{type_list}\n\n请告诉我您想查看哪种类型的凭证规则？"
-
-            await save_chat_message(
-                session_id=chat_session_id,
-                user_id=user["id"],
-                role="assistant",
-                content=reply,
-                message_type="chat",
-                metadata={"pending_action": "rule_query"},
-            )
-            yield _sse({"type": "result", **{
-                "reply": reply,
-                "session_id": session_id,
-            }})
-            return
-
-        # User specified a type — load from database and return matching rules
+        # Load rules from database (all types if rule_type is None)
+        # rule_type is None means user wants to see all rules
         try:
             rules_list = await list_rules(business_type=rule_type)
             rules_list = _format_rules_for_frontend(rules_list)
@@ -1044,7 +1084,7 @@ async def _chat_stream(payload: dict, request: Request):
             }})
             return
 
-        biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type)
+        biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type) if rule_type else "全部"
 
         if not rules_list:
             if not reply:
@@ -1052,7 +1092,7 @@ async def _chat_stream(payload: dict, request: Request):
             yield _sse({"type": "result", **{"reply": reply, "session_id": session_id, "view": "rules", "rules": [], "rule_type": rule_type, "a2ui": {"messages": _rules_to_a2ui([], rule_type)}}})
             return
 
-        if not reply:
+        if not reply or rule_type is None:
             reply = f"以下是「{biz_label}」类型的凭证规则，共 {len(rules_list)} 条："
 
         await save_chat_message(
@@ -1721,6 +1761,24 @@ async def handle_a2ui_action(request: Request):
             "a2ui": {"messages": _rules_to_a2ui([], rule_type, {"action": "create", "rule_type": rule_type})},
         })
 
+    if event_name == "view_rule_detail":
+        rule_code = event_data.get("ruleCode", "")
+        rule = await get_rule(rule_code)
+        if not rule:
+            return JSONResponse({"status": "error", "message": f"规则 {rule_code} 不存在"})
+        return JSONResponse({
+            "status": "ok",
+            "a2ui": {"messages": _rule_detail_to_a2ui(rule)},
+        })
+
+    if event_name == "back_to_rules":
+        rules_list = await list_rules()
+        rules_list = _format_rules_for_frontend(rules_list)
+        return JSONResponse({
+            "status": "ok",
+            "a2ui": {"messages": _rules_to_a2ui(rules_list, None)},
+        })
+
     if event_name in ("view_voucher_detail", "edit_voucher"):
         voucher_id = event_data.get("voucherId", "")
         db_record = await get_voucher_record(voucher_id)
@@ -1730,10 +1788,13 @@ async def handle_a2ui_action(request: Request):
         voucher_front["status"] = db_record.get("status", "draft")
         show_actions = event_name == "edit_voucher"
         attachments = await list_attachments(voucher_id)
-        return JSONResponse({
+        resp = {
             "status": "ok",
             "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_id, show_actions=show_actions, attachments=attachments)},
-        })
+        }
+        if event_name == "edit_voucher":
+            resp["voucher"] = voucher_front
+        return JSONResponse(resp)
 
     if event_name == "upload_attachment":
         voucher_id = event_data.get("voucherId", "")

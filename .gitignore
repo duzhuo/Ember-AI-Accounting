@@ -3,8 +3,5 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .env
-data/sessions/
-data/uploads/
-data/output/
+data/
 *.sqlite3
-data/ember.db
