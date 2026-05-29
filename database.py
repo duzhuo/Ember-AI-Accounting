@@ -182,6 +182,30 @@ CREATE TABLE IF NOT EXISTS voucher_attachments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_voucher_attachments_voucher ON voucher_attachments(voucher_id);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    ip TEXT NOT NULL,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    last_failed_at TEXT NOT NULL,
+    PRIMARY KEY (ip)
+);
+
+CREATE TABLE IF NOT EXISTS approval_records (
+    id TEXT PRIMARY KEY,
+    voucher_id TEXT NOT NULL UNIQUE,
+    requested_by TEXT NOT NULL,
+    approver_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    action_at TEXT,
+    action_by TEXT,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (voucher_id) REFERENCES voucher_records(voucher_id) ON DELETE CASCADE,
+    FOREIGN KEY (requested_by) REFERENCES users(id),
+    FOREIGN KEY (approver_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_records_approver ON approval_records(approver_id);
+CREATE INDEX IF NOT EXISTS idx_approval_records_status ON approval_records(status);
 """
 
 
@@ -522,7 +546,7 @@ async def mark_voucher_posted(voucher_id: str, posted_by: str) -> bool:
         cursor = await db.execute(
             """UPDATE voucher_records
                SET status = 'posted', posted_at = ?, posted_by = ?
-               WHERE voucher_id = ?""",
+               WHERE voucher_id = ? AND status = 'draft'""",
             (datetime.now().isoformat(), posted_by, voucher_id),
         )
         await db.commit()
@@ -548,15 +572,27 @@ async def mark_voucher_reversed(voucher_id: str, reversed_by: str, reason: str) 
 
 
 async def create_reversal_voucher(original_voucher_id: str, user_id: str, reason: str) -> str | None:
-    """Create a reversal (red-letter) voucher for a posted voucher. Returns new voucher_id or None."""
+    """Create a reversal voucher and mark the original as reversed in one atomic transaction.
+    Returns new voucher_id or None if original not found / already reversed."""
     db = await get_db()
     try:
+        await db.execute("BEGIN")
         cursor = await db.execute(
             "SELECT * FROM voucher_records WHERE voucher_id = ? AND status = 'posted'",
             (original_voucher_id,),
         )
         row = await cursor.fetchone()
         if row is None:
+            await db.execute("ROLLBACK")
+            return None
+
+        # Check no reversal already exists
+        rev_check = await db.execute(
+            "SELECT voucher_id FROM voucher_records WHERE voucher_id = ?",
+            (f"REV-{original_voucher_id}",),
+        )
+        if await rev_check.fetchone():
+            await db.execute("ROLLBACK")
             return None
 
         original = dict(row)
@@ -572,7 +608,6 @@ async def create_reversal_voucher(original_voucher_id: str, user_id: str, reason
             new_r["debit"] = old_credit
             new_r["credit"] = old_debit
             new_r["dc"] = "H" if old_debit > 0 else "S"
-            # Prefix summary with reversal note
             orig_summary = new_r.get("text", "")
             new_r["text"] = f"冲销{original_voucher_id}: {orig_summary}" if orig_summary else f"冲销{original_voucher_id}"
             reversal_rows.append(new_r)
@@ -602,8 +637,19 @@ async def create_reversal_voucher(original_voucher_id: str, user_id: str, reason
                 now, now, user_id,
             ),
         )
+
+        await db.execute(
+            """UPDATE voucher_records
+               SET status = 'reversed', reversed_at = ?, reversed_by = ?, reversal_reason = ?
+               WHERE voucher_id = ? AND status = 'posted'""",
+            (now, user_id, reason, original_voucher_id),
+        )
+
         await db.commit()
         return new_voucher_id
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
     finally:
         await db.close()
 
@@ -660,16 +706,20 @@ async def list_voucher_records(
             params.append(status)
         if keyword:
             like = f"%{keyword}%"
-            conditions.append(
-                "(vr.header_text LIKE ? OR vr.reference LIKE ? OR vr.voucher_data LIKE ?)"
-            )
-            params.extend([like, like, like])
+            conditions.append("(vr.header_text LIKE ? OR vr.reference LIKE ?)")
+            params.extend([like, like])
         if date_from:
             conditions.append("vr.document_date >= ?")
             params.append(date_from)
         if date_to:
             conditions.append("vr.document_date <= ?")
             params.append(date_to)
+        if amount_min is not None:
+            conditions.append("CAST(json_extract(vr.voucher_data, '$.total_amount') AS REAL) >= ?")
+            params.append(amount_min)
+        if amount_max is not None:
+            conditions.append("CAST(json_extract(vr.voucher_data, '$.total_amount') AS REAL) <= ?")
+            params.append(amount_max)
 
         where = " AND ".join(conditions) if conditions else "1=1"
         params.extend([limit, offset])
@@ -725,6 +775,8 @@ async def count_voucher_records(
     keyword: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
 ) -> int:
     """Count voucher records with optional filters."""
     db = await get_db()
@@ -739,16 +791,20 @@ async def count_voucher_records(
             params.append(status)
         if keyword:
             like = f"%{keyword}%"
-            conditions.append(
-                "(header_text LIKE ? OR reference LIKE ? OR voucher_data LIKE ?)"
-            )
-            params.extend([like, like, like])
+            conditions.append("(header_text LIKE ? OR reference LIKE ?)")
+            params.extend([like, like])
         if date_from:
             conditions.append("document_date >= ?")
             params.append(date_from)
         if date_to:
             conditions.append("document_date <= ?")
             params.append(date_to)
+        if amount_min is not None:
+            conditions.append("CAST(json_extract(voucher_data, '$.total_amount') AS REAL) >= ?")
+            params.append(amount_min)
+        if amount_max is not None:
+            conditions.append("CAST(json_extract(voucher_data, '$.total_amount') AS REAL) <= ?")
+            params.append(amount_max)
         where = " AND ".join(conditions) if conditions else "1=1"
         cursor = await db.execute(f"SELECT COUNT(*) FROM voucher_records WHERE {where}", params)
         row = await cursor.fetchone()
@@ -1205,5 +1261,197 @@ async def delete_attachment(attachment_id: str) -> bool:
         cursor = await db.execute("DELETE FROM voucher_attachments WHERE id = ?", (attachment_id,))
         await db.commit()
         return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_attachment(attachment_id: str) -> dict | None:
+    """Get a single attachment record by ID."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM voucher_attachments WHERE id = ?", (attachment_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+# ── Voucher ID generation ────────────────────────────────────────────────────
+
+
+async def next_voucher_id(prefix: str, date_str: str) -> str:
+    """Return the next unique voucher ID like VR-SO-20260529-003."""
+    pattern = f"VR-{prefix}-{date_str}-%"
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM voucher_records WHERE voucher_id LIKE ?", (pattern,)
+        )
+        row = await cursor.fetchone()
+        seq = (row[0] if row else 0) + 1
+    finally:
+        await db.close()
+    return f"VR-{prefix}-{date_str}-{seq:03d}"
+
+
+# ── Login rate limiting (SQLite-backed) ──────────────────────────────────────
+
+_MAX_LOGIN_FAILS = 5
+_LOCKOUT_SECONDS = 300
+
+
+async def is_login_rate_limited(ip: str) -> bool:
+    """Return True if the IP is currently locked out."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT failed_count, last_failed_at FROM login_attempts WHERE ip = ?", (ip,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False
+        last = datetime.fromisoformat(row["last_failed_at"])
+        if row["failed_count"] >= _MAX_LOGIN_FAILS and datetime.now() - last < timedelta(seconds=_LOCKOUT_SECONDS):
+            return True
+        if datetime.now() - last >= timedelta(seconds=_LOCKOUT_SECONDS):
+            await db.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+            await db.commit()
+        return False
+    finally:
+        await db.close()
+
+
+async def record_login_failure(ip: str) -> None:
+    """Increment failed login count for an IP."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        await db.execute(
+            """INSERT INTO login_attempts (ip, failed_count, last_failed_at)
+               VALUES (?, 1, ?)
+               ON CONFLICT(ip) DO UPDATE SET
+                 failed_count = failed_count + 1,
+                 last_failed_at = excluded.last_failed_at""",
+            (ip, now),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def clear_login_failures(ip: str) -> None:
+    """Clear failed login count for an IP after successful login."""
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# ── Approval flow ─────────────────────────────────────────────────────────────
+
+
+async def submit_voucher_for_approval(voucher_id: str, requested_by: str, approver_id: str) -> bool:
+    """Set voucher status to pending_approval and create an approval record."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        cursor = await db.execute(
+            "UPDATE voucher_records SET status='pending_approval' WHERE voucher_id=? AND status='draft'",
+            (voucher_id,),
+        )
+        if cursor.rowcount == 0:
+            return False
+        await db.execute(
+            """INSERT INTO approval_records (id, voucher_id, requested_by, approver_id, status, created_at)
+               VALUES (?, ?, ?, ?, 'pending', ?)
+               ON CONFLICT(voucher_id) DO UPDATE SET
+                 requested_by=excluded.requested_by,
+                 approver_id=excluded.approver_id,
+                 status='pending',
+                 action_at=NULL, action_by=NULL, comment=NULL,
+                 created_at=excluded.created_at""",
+            (str(uuid.uuid4()), voucher_id, requested_by, approver_id, now),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def approve_voucher(voucher_id: str, action_by: str, comment: str = "") -> bool:
+    """Approve a pending voucher: mark as posted and update approval record."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        cursor = await db.execute(
+            "UPDATE voucher_records SET status='posted', posted_at=?, posted_by=? WHERE voucher_id=? AND status='pending_approval'",
+            (now, action_by, voucher_id),
+        )
+        if cursor.rowcount == 0:
+            return False
+        await db.execute(
+            "UPDATE approval_records SET status='approved', action_at=?, action_by=?, comment=? WHERE voucher_id=?",
+            (now, action_by, comment, voucher_id),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def reject_voucher(voucher_id: str, action_by: str, comment: str = "") -> bool:
+    """Reject a pending voucher: return to draft and update approval record."""
+    db = await get_db()
+    try:
+        now = datetime.now().isoformat()
+        cursor = await db.execute(
+            "UPDATE voucher_records SET status='draft' WHERE voucher_id=? AND status='pending_approval'",
+            (voucher_id,),
+        )
+        if cursor.rowcount == 0:
+            return False
+        await db.execute(
+            "UPDATE approval_records SET status='rejected', action_at=?, action_by=?, comment=? WHERE voucher_id=?",
+            (now, action_by, comment, voucher_id),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def get_approval_record(voucher_id: str) -> dict | None:
+    """Get the approval record for a voucher."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM approval_records WHERE voucher_id = ?", (voucher_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await db.close()
+
+
+async def list_pending_approvals(approver_id: str) -> list[dict]:
+    """List vouchers pending approval for a specific approver."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT ar.*, vr.header_text, vr.document_date, vr.company_code,
+                      u.display_name as requester_name
+               FROM approval_records ar
+               JOIN voucher_records vr ON ar.voucher_id = vr.voucher_id
+               LEFT JOIN users u ON ar.requested_by = u.id
+               WHERE ar.approver_id = ? AND ar.status = 'pending'
+               ORDER BY ar.created_at DESC""",
+            (approver_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
     finally:
         await db.close()

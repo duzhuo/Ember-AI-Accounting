@@ -21,7 +21,7 @@ from agents.ocr_agent import OcrAgent
 
 from database import init_db, migrate_rules_from_excel, seed_default_rules, clean_expired_sessions
 
-from routes import auth, chat, upload, vouchers, rules, audit, attachments, confirm, a2ui_action
+from routes import auth, chat, upload, vouchers, rules, audit, attachments, confirm, a2ui_action, export, approval
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +65,8 @@ app.include_router(audit.router)
 app.include_router(attachments.router)
 app.include_router(confirm.router)
 app.include_router(a2ui_action.router)
+app.include_router(export.router)
+app.include_router(approval.router)
 
 # ── Startup / Shutdown ──────────────────────────────────────────────────────
 

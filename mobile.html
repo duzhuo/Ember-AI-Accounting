@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#2563eb">
+    <title>Ember 智能记账</title>
+    <link rel="stylesheet" href="mobile.css">
+</head>
+<body>
+
+<!-- ── Toast ─────────────────────────────────────────────────────────────── -->
+<div class="toast" id="toast"></div>
+
+<!-- ── 登录页 ─────────────────────────────────────────────────────────────── -->
+<div class="screen login-screen active" id="screen-login">
+    <div class="login-card">
+        <div class="login-logo">
+            <div class="logo-icon">🔥</div>
+            <div>
+                <h1>Ember</h1>
+                <p>智能记账助手</p>
+            </div>
+        </div>
+
+        <form id="login-form">
+            <div class="form-group">
+                <label for="login-username">用户名</label>
+                <input id="login-username" type="text" placeholder="请输入用户名"
+                       autocomplete="username" autocapitalize="none" required>
+            </div>
+            <div class="form-group">
+                <label for="login-password">密码</label>
+                <input id="login-password" type="password" placeholder="请输入密码"
+                       autocomplete="current-password" required>
+            </div>
+            <div class="error-msg" id="login-error"></div>
+            <button class="btn btn-primary" type="submit" id="login-btn">登录</button>
+        </form>
+    </div>
+</div>
+
+<!-- ── 首页 ───────────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-home">
+    <nav class="top-nav">
+        <h2>🔥 Ember 记账</h2>
+        <span class="nav-user" id="nav-user-home"></span>
+        <button class="nav-logout" id="logout-btn" title="退出登录">⏻</button>
+    </nav>
+
+    <div class="home-content">
+        <div class="welcome-card">
+            <h2>拍照即可记账</h2>
+            <p>上传发票或凭证图片，AI 自动识别并生成会计分录</p>
+        </div>
+
+        <div class="action-grid">
+            <div class="action-card" id="action-upload">
+                <div class="ac-icon blue">📷</div>
+                <span>拍照上传</span>
+            </div>
+            <div class="action-card" id="action-list">
+                <div class="ac-icon green">📋</div>
+                <span>凭证列表</span>
+            </div>
+        </div>
+
+        <div class="section-title">最近凭证</div>
+        <div class="recent-list" id="recent-list">
+            <p style="font-size:0.82rem;color:var(--text-secondary);text-align:center;padding:1rem 0">加载中…</p>
+        </div>
+    </div>
+</div>
+
+<!-- ── 上传页 ──────────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-upload">
+    <nav class="top-nav">
+        <button class="nav-back" id="upload-nav-back">‹</button>
+        <h2>上传发票</h2>
+    </nav>
+
+    <div class="upload-content">
+        <div class="upload-zone" id="upload-zone">
+            <span class="uz-icon">📄</span>
+            <h3>点击或拖入文件</h3>
+            <p>支持发票图片（JPG/PNG）、PDF、Excel<br>可同时拖入多个文件批量处理</p>
+        </div>
+
+        <div class="camera-btn-row">
+            <button class="camera-btn" id="btn-camera">
+                <span class="icon">📷</span>
+                拍照上传
+            </button>
+            <button class="camera-btn" id="btn-album">
+                <span class="icon">🖼️</span>
+                从相册选择
+            </button>
+        </div>
+
+        <div class="progress-card" id="progress-card">
+            <div class="progress-header">
+                <div class="progress-text" id="progress-text">处理中…</div>
+                <button class="btn-abort" id="btn-abort" title="取消">✕</button>
+            </div>
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+        </div>
+
+        <!-- 批量处理完成结果卡 -->
+        <div class="batch-result-card" id="batch-result" style="display:none">
+            <div class="batch-summary" id="batch-summary"></div>
+            <div class="batch-errors" id="batch-errors"></div>
+            <button class="btn btn-download-csv" id="btn-download-csv">⬇ 下载 SAP CSV</button>
+            <button class="btn btn-secondary" id="btn-batch-reset">重新上传</button>
+        </div>
+    </div>
+
+    <input type="file" id="file-input" style="display:none" multiple
+           accept=".xlsx,.xls,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pdf">
+</div>
+
+<!-- ── 凭证详情页 ──────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-voucher">
+    <nav class="top-nav">
+        <button class="nav-back" id="voucher-nav-back">‹</button>
+        <h2>凭证详情</h2>
+    </nav>
+
+    <div class="voucher-content">
+        <!-- 头部信息 -->
+        <div class="voucher-header-card">
+            <div class="vh-row">
+                <span class="vh-id" id="v-id"></span>
+                <span class="badge" id="v-status"></span>
+            </div>
+            <div class="vh-date" id="v-date"></div>
+            <div class="vh-desc" id="v-desc"></div>
+        </div>
+
+        <!-- 置信度 + 警告 -->
+        <div class="confidence">
+            <span class="confidence-dot" id="v-conf-dot"></span>
+            <span id="v-conf-txt"></span>
+        </div>
+        <div class="warning-card" id="v-warnings"></div>
+
+        <!-- KV 信息 -->
+        <div class="voucher-header-card">
+            <div class="kv-list">
+                <div class="kv-row">
+                    <span class="kv-label">公司代码</span>
+                    <span class="kv-value" id="v-company"></span>
+                </div>
+                <div class="kv-row">
+                    <span class="kv-label">凭证类型</span>
+                    <span class="kv-value" id="v-doctype"></span>
+                </div>
+                <div class="kv-row">
+                    <span class="kv-label">参考号</span>
+                    <span class="kv-value" id="v-ref"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 分录明细 -->
+        <div class="lines-card">
+            <div class="card-title">会计分录</div>
+            <div id="v-lines"></div>
+        </div>
+    </div>
+
+    <!-- 操作栏 (sticky bottom) -->
+    <div class="action-bar">
+        <button class="btn btn-success" id="btn-confirm">✓ 确认过账</button>
+        <div class="btn" id="btn-confirmed-label"
+             style="display:none;background:var(--bg-color);color:var(--text-secondary);flex:1;cursor:default">
+            ✓ 已过账
+        </div>
+    </div>
+</div>
+
+<!-- ── 凭证列表页 ──────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-list">
+    <nav class="top-nav">
+        <button class="nav-back" id="list-nav-back">‹</button>
+        <h2>凭证列表</h2>
+    </nav>
+
+    <div class="list-content">
+        <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">全部</button>
+            <button class="filter-tab" data-filter="draft">草稿</button>
+            <button class="filter-tab" data-filter="posted">已过账</button>
+            <button class="filter-tab" data-filter="reversed">已冲销</button>
+        </div>
+
+        <div class="voucher-list" id="voucher-list"></div>
+
+        <div class="list-empty" id="list-empty">
+            <div class="le-icon">📭</div>
+            暂无凭证记录
+        </div>
+    </div>
+</div>
+
+<script src="mobile.js"></script>
+</body>
+</html>

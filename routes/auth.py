@@ -1,8 +1,5 @@
 """Auth and user management routes."""
 
-import time
-from collections import defaultdict
-
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -11,42 +8,20 @@ from database import (
     add_audit_log,
     authenticate_user,
     change_password,
+    clear_login_failures,
     create_session_token,
     create_user,
     delete_session,
     delete_user,
+    is_login_rate_limited,
     list_users,
+    record_login_failure,
     update_user,
     verify_password,
     get_db,
 )
 
 router = APIRouter()
-
-# ── Login rate limiting ──────────────────────────────────────────────────────
-
-_login_failures: dict[str, tuple[int, float]] = defaultdict(lambda: (0, 0.0))
-_MAX_FAILS = 5
-_LOCKOUT_SECONDS = 300
-
-
-def _check_rate_limit(ip: str) -> bool:
-    """Return True if the IP is rate-limited."""
-    count, last_fail = _login_failures[ip]
-    if count >= _MAX_FAILS and (time.time() - last_fail) < _LOCKOUT_SECONDS:
-        return True
-    if (time.time() - last_fail) >= _LOCKOUT_SECONDS:
-        _login_failures[ip] = (0, 0.0)
-    return False
-
-
-def _record_failure(ip: str) -> None:
-    count, _ = _login_failures[ip]
-    _login_failures[ip] = (count + 1, time.time())
-
-
-def _clear_failures(ip: str) -> None:
-    _login_failures.pop(ip, None)
 
 
 # ── Auth routes ──────────────────────────────────────────────────────────────
@@ -61,16 +36,16 @@ async def login(payload: dict, request: Request):
     if not username or not password:
         return JSONResponse({"error": "请输入用户名和密码"}, status_code=400)
 
-    if _check_rate_limit(ip):
+    if await is_login_rate_limited(ip):
         return JSONResponse({"error": "登录失败次数过多，请5分钟后再试"}, status_code=429)
 
     user = await authenticate_user(username, password)
     if not user:
-        _record_failure(ip)
+        await record_login_failure(ip)
         await add_audit_log(action="login.failed", username=username, ip_address=ip)
         return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
 
-    _clear_failures(ip)
+    await clear_login_failures(ip)
     token = await create_session_token(user["id"])
     await add_audit_log(
         action="login.success", user_id=user["id"], username=user["username"], ip_address=ip,
