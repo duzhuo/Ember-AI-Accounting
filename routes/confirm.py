@@ -1,6 +1,5 @@
 """Confirm voucher (post) route."""
 
-import json
 import logging
 
 from fastapi import APIRouter, Request
@@ -8,7 +7,8 @@ from fastapi.responses import JSONResponse
 
 from helpers.auth import _get_session, _require_auth, _save_session
 from helpers.csv_export import POSTED_CSV, _append_posted_csv, _append_posted_csv_from_record
-from database import add_audit_log, batch_mark_voucher_posted, get_voucher_record, mark_voucher_posted, save_chat_message
+from helpers.voucher import post_voucher
+from database import add_audit_log, batch_mark_voucher_posted, get_voucher_record, save_chat_message
 
 logger = logging.getLogger(__name__)
 
@@ -28,30 +28,24 @@ async def confirm_voucher(payload: dict, request: Request):
             voucher = v
             break
 
-    db_record = None
     if not voucher:
-        db_record = await get_voucher_record(voucher_id)
-        if not db_record:
-            return JSONResponse({"status": "not_found", "message": f"凭证 {voucher_id} 不存在"})
-        if db_record.get("status") == "posted":
-            return JSONResponse({"status": "already_posted", "message": f"凭证 {voucher_id} 已经过账"})
-
-    if voucher:
-        _append_posted_csv(voucher)
-    else:
+        result = await post_voucher(voucher_id, user)
+        if result["status"] not in ("posted",):
+            code = 403 if result["status"] == "forbidden" else (400 if "不平衡" in result.get("message", "") else 200)
+            return JSONResponse(result, status_code=code)
+        db_record = result["record"]
         _append_posted_csv_from_record(db_record)
-
-    if voucher:
+    else:
+        result = await post_voucher(voucher_id, user)
+        if result["status"] not in ("posted",):
+            code = 403 if result["status"] == "forbidden" else (400 if "不平衡" in result.get("message", "") else 200)
+            return JSONResponse(result, status_code=code)
+        _append_posted_csv(voucher)
         session["posted_voucher_ids"] = session.get("posted_voucher_ids", [])
         if voucher_id not in session["posted_voucher_ids"]:
             session["posted_voucher_ids"].append(voucher_id)
         _save_session(session_id, session)
 
-    await mark_voucher_posted(voucher_id, user["id"])
-    await add_audit_log(
-        action="voucher.post", user_id=user["id"], username=user["username"],
-        target_type="voucher", target_id=voucher_id, details={"session_id": session_id},
-    )
     await save_chat_message(
         session_id=session_id or "unknown", user_id=user["id"],
         role="assistant", content=f"凭证 {voucher_id} 已确认记账",
@@ -75,6 +69,13 @@ async def confirm_voucher_batch(payload: dict, request: Request):
         return JSONResponse({"error": "请选择至少一个凭证"}, status_code=400)
     if len(voucher_ids) > 100:
         return JSONResponse({"error": "单次最多批量过账100个凭证"}, status_code=400)
+
+    # Ownership check for non-admin users
+    if user["role"] != "admin":
+        for vid in voucher_ids:
+            rec = await get_voucher_record(vid)
+            if rec and rec["user_id"] != user["id"]:
+                return JSONResponse({"error": f"无权操作凭证 {vid}"}, status_code=403)
 
     result = await batch_mark_voucher_posted(voucher_ids, user["id"])
 

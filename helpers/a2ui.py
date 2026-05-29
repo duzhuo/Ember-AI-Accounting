@@ -155,8 +155,8 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
     return _build_a2ui_messages("voucher-detail", components)
 
 
-def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None) -> dict:
-    """Convert voucher records list to A2UI messages."""
+def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+    """Convert voucher records list to A2UI messages with pagination."""
     status_label = {"draft": "草稿", "posted": "已过账", "reversed": "已冲销"}.get(status_filter, "全部")
 
     tabs = [
@@ -208,6 +208,27 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, 
          "columns": table_columns, "rows": table_rows, "selectable": True,
          "rowAction": {"event": {"name": "view_voucher_detail", "data": {"voucherId": "{voucher_id}"}}}},
     ]
+
+    # Pagination
+    has_prev = offset > 0
+    has_next = offset + limit < total
+    page_num = offset // limit + 1
+    total_pages = max(1, (total + limit - 1) // limit)
+    if total > limit:
+        pagination_data = {"status": status_filter or "", "keyword": keyword or ""}
+        components.append({"id": "pagination-row", "component": "Row", "children": ["prev-btn", "page-info", "next-btn"]})
+        components.append({"id": "prev-btn", "component": "Button", "child": "prev-text",
+                           "variant": "secondary", "disabled": not has_prev,
+                           "action": {"event": {"name": "filter_vouchers" if not keyword else "search_vouchers",
+                                      "data": {**pagination_data, "limit": limit, "offset": max(0, offset - limit)}}}})
+        components.append({"id": "prev-text", "component": "Text", "text": "上一页"})
+        components.append({"id": "page-info", "component": "Text", "text": f"第 {page_num}/{total_pages} 页", "variant": "caption"})
+        components.append({"id": "next-btn", "component": "Button", "child": "next-text",
+                           "variant": "secondary", "disabled": not has_next,
+                           "action": {"event": {"name": "filter_vouchers" if not keyword else "search_vouchers",
+                                      "data": {**pagination_data, "limit": limit, "offset": offset + limit}}}})
+        components.append({"id": "next-text", "component": "Text", "text": "下一页"})
+
     return _build_a2ui_messages("voucher-list", components)
 
 

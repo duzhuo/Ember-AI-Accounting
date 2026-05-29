@@ -29,7 +29,7 @@ async def get_voucher_rules(request: Request, business_type: str | None = None):
         rules = _format_rules_for_frontend(rules)
     except Exception as exc:
         logger.error("Failed to load voucher rules: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "加载规则失败"}, status_code=500)
     total_lines = sum(len(r.get("lines", [])) for r in rules)
     return JSONResponse({"rules": rules, "total_rules": len(rules), "total_lines": total_lines})
 

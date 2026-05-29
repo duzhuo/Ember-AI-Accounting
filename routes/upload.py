@@ -14,6 +14,7 @@ from agentscope.message import UserMsg
 
 from helpers.a2ui import BIZ_TYPE_LABELS, _voucher_to_a2ui
 from helpers.auth import _get_session, _require_auth, _save_session
+from helpers.constants import SUPPORTED_BUSINESS_TYPES
 from database import (
     add_audit_log,
     get_voucher_record,
@@ -38,11 +39,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 PDF_EXTENSIONS = {".pdf"}
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
-SUPPORTED_BUSINESS_TYPES = {
-    "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
-    "expense": "费用报销（餐饮、差旅、办公等费用报销）",
-}
 
 
 @router.post("/api/upload")
@@ -60,7 +58,7 @@ async def _upload_stream(request: Request, file: UploadFile, session_id: str | N
             yield event
     except Exception as exc:
         logger.error("Upload error: %s", exc, exc_info=True)
-        yield _sse({"type": "error", "reply": f"文件处理出错：{exc}"})
+        yield _sse({"type": "error", "reply": "文件处理出错，请重试"})
 
 
 async def _upload_file_impl(request: Request, file: UploadFile, session_id: str | None):
@@ -77,6 +75,11 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
     )
 
     yield _sse({"type": "progress", "text": f"正在保存文件 {file.filename}..."})
+
+    # File size check
+    if file.size and file.size > MAX_FILE_SIZE:
+        yield _sse({"type": "error", "reply": f"文件大小超过限制（最大 20MB，当前 {file.size / 1024 / 1024:.1f}MB）"})
+        return
 
     file_id = str(uuid.uuid4())[:8]
     suffix = Path(file.filename or "upload.xlsx").suffix.lower()
@@ -178,7 +181,7 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
         transactions = load_sales_transactions(saved_path)
     except Exception as exc:
         logger.warning("Failed to parse uploaded file: %s", exc)
-        yield _sse({"type": "error", "reply": f"文件解析失败：{exc}。请确保Excel格式正确。"})
+        yield _sse({"type": "error", "reply": "文件解析失败，请检查文件格式"})
         return
 
     vouchers = []

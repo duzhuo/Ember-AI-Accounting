@@ -31,17 +31,13 @@ from database import (
     save_chat_message,
     save_voucher_record,
 )
+from helpers.constants import SUPPORTED_BUSINESS_TYPES
 from helpers.sse import _sse, _extract_reply_delta
 from helpers.voucher import _format_rules_for_frontend, _voucher_to_front
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-SUPPORTED_BUSINESS_TYPES = {
-    "sales_revenue": "销售收入（销售商品或提供服务产生的收入）",
-    "expense": "费用报销（餐饮、差旅、办公等费用报销）",
-}
 
 
 @router.post("/api/chat")
@@ -361,7 +357,7 @@ async def _chat_stream(payload: dict, request: Request):
             return
         except Exception as exc:
             logger.error("voucher_query error: %s", exc, exc_info=True)
-            yield _sse({"type": "result", "reply": f"查询凭证时出错：{exc}", "session_id": session_id})
+            yield _sse({"type": "result", "reply": "查询凭证时出错，请重试", "session_id": session_id})
             return
 
     # Handle user_mgmt intent

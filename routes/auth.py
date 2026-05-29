@@ -156,6 +156,8 @@ async def api_create_user(payload: dict, request: Request):
 
     if not username or not password or not display_name:
         return JSONResponse({"error": "用户名、密码和显示名称不能为空"}, status_code=400)
+    if len(password) < 6:
+        return JSONResponse({"error": "密码至少6位"}, status_code=400)
     if role not in ("user", "admin"):
         return JSONResponse({"error": "无效的角色类型"}, status_code=400)
 
@@ -164,7 +166,8 @@ async def api_create_user(payload: dict, request: Request):
     except Exception as exc:
         if "UNIQUE constraint" in str(exc):
             return JSONResponse({"error": f"用户名「{username}」已存在"}, status_code=400)
-        raise
+        logger.error("Failed to create user: %s", exc)
+        return JSONResponse({"error": "创建用户失败"}, status_code=500)
 
     await add_audit_log(
         action="user.create", user_id=admin["id"], username=admin["username"],
