@@ -447,7 +447,7 @@ async def _chat_stream(payload: dict, request: Request):
     _save_session(session_id, session)
 
     voucher_front = _voucher_to_front(voucher)
-    await save_voucher_record(
+    _, actual_vid = await save_voucher_record(
         voucher_id=voucher.voucher_id, user_id=user["id"],
         voucher_data=voucher_front, session_id=session_id,
         company_code=voucher.company_code, document_type=voucher.document_type,
@@ -455,9 +455,11 @@ async def _chat_stream(payload: dict, request: Request):
         reference=voucher.reference, header_text=voucher.header_text,
         confidence=str(voucher.confidence), warnings=voucher.warnings,
     )
+    # Use the actual voucher_id (may differ if original was owned by another user)
+    voucher_front["voucher_id"] = actual_vid
     await add_audit_log(
         action="voucher.generate", user_id=user["id"], username=user["username"],
-        target_type="voucher", target_id=voucher.voucher_id,
+        target_type="voucher", target_id=actual_vid,
         details={"business_type": business_type},
     )
 
@@ -467,11 +469,11 @@ async def _chat_stream(payload: dict, request: Request):
     await save_chat_message(
         session_id=chat_session_id, user_id=user["id"],
         role="assistant", content=reply, message_type="chat",
-        metadata={"voucher_id": voucher.voucher_id},
+        metadata={"voucher_id": actual_vid},
     )
     yield _sse({"type": "result", **{
         "reply": reply, "session_id": session_id,
         "voucher": voucher_front, "view": "voucher",
-        "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher.voucher_id)},
+        "a2ui": {"messages": _voucher_to_a2ui(voucher_front, actual_vid)},
     }})
     return

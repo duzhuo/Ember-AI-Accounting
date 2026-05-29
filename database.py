@@ -479,14 +479,17 @@ async def save_voucher_record(
     confidence: str = "",
     warnings: list | None = None,
 ) -> str:
-    """Save a voucher record to the database. Returns the record ID (existing if duplicate)."""
+    """Save a voucher record to the database. Returns (record_id, voucher_id) tuple."""
     db = await get_db()
     try:
         # Check if voucher_id already exists
-        cursor = await db.execute("SELECT id FROM voucher_records WHERE voucher_id = ?", (voucher_id,))
+        cursor = await db.execute("SELECT id, user_id FROM voucher_records WHERE voucher_id = ?", (voucher_id,))
         existing = await cursor.fetchone()
         if existing:
-            return existing["id"]
+            if existing["user_id"] == user_id:
+                return existing["id"], voucher_id
+            # Ownership conflict: generate a unique voucher_id for this user
+            voucher_id = f"{voucher_id}-{uuid.uuid4().hex[:6]}"
 
         record_id = str(uuid.uuid4())
         await db.execute(
@@ -506,7 +509,7 @@ async def save_voucher_record(
             ),
         )
         await db.commit()
-        return record_id
+        return record_id, voucher_id
     finally:
         await db.close()
 

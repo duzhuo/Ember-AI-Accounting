@@ -139,7 +139,7 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
         _save_session(session_id, session)
 
         voucher_front = _voucher_to_front(voucher)
-        await save_voucher_record(
+        _, actual_vid = await save_voucher_record(
             voucher_id=voucher.voucher_id, user_id=user["id"],
             voucher_data=voucher_front, session_id=session_id,
             company_code=voucher.company_code, document_type=voucher.document_type,
@@ -147,15 +147,16 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
             reference=voucher.reference, header_text=voucher.header_text,
             confidence=str(voucher.confidence), warnings=voucher.warnings,
         )
+        voucher_front["voucher_id"] = actual_vid
         await save_attachment(
-            voucher_id=voucher.voucher_id,
+            voucher_id=actual_vid,
             filename=file.filename or f"{file_id}{suffix}",
             file_path=str(saved_path), file_size=file_info["size"],
             content_type=file.content_type or "", uploaded_by=user["id"],
         )
         await add_audit_log(
             action="voucher.generate", user_id=user["id"], username=user["username"],
-            target_type="voucher", target_id=voucher.voucher_id,
+            target_type="voucher", target_id=actual_vid,
             details={"source": source_label, "filename": file.filename},
         )
 
@@ -164,14 +165,14 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
 
         biz_label = BIZ_TYPE_LABELS.get(business_type, business_type)
         reply = f"已从{source_label}中识别出1笔{biz_label}交易，生成了1张凭证草稿。"
-        await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": voucher.voucher_id})
+        await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": actual_vid})
 
-        attachments = await list_attachments(voucher.voucher_id)
+        attachments = await list_attachments(actual_vid)
         yield _sse({"type": "result", **{
             "reply": reply, "session_id": session_id,
             "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
             "vouchers": [voucher_front],
-            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, voucher_front["voucher_id"], attachments=attachments)},
+            "a2ui": {"messages": _voucher_to_a2ui(voucher_front, actual_vid, attachments=attachments)},
         }})
         return
 
@@ -185,6 +186,7 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
         return
 
     vouchers = []
+    voucher_id_map = {}  # original_vid -> actual_vid
     skipped = []
     failed = []
     total = len(transactions)
@@ -207,7 +209,7 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
         vouchers.append(voucher)
 
         voucher_front = _voucher_to_front(voucher)
-        await save_voucher_record(
+        _, actual_vid = await save_voucher_record(
             voucher_id=voucher.voucher_id, user_id=user["id"],
             voucher_data=voucher_front, session_id=session_id,
             company_code=voucher.company_code, document_type=voucher.document_type,
@@ -215,9 +217,11 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
             reference=voucher.reference, header_text=voucher.header_text,
             confidence=str(voucher.confidence), warnings=voucher.warnings,
         )
+        voucher_id_map[voucher.voucher_id] = actual_vid
+        voucher_front["voucher_id"] = actual_vid
         await add_audit_log(
             action="voucher.generate", user_id=user["id"], username=user["username"],
-            target_type="voucher", target_id=voucher.voucher_id,
+            target_type="voucher", target_id=actual_vid,
             details={"source": "excel", "filename": file.filename},
         )
 
@@ -236,9 +240,14 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
 
     await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_count": len(vouchers)})
 
-    voucher_fronts = [_voucher_to_front(v) for v in vouchers]
+    voucher_fronts = []
+    for v in vouchers:
+        vf = _voucher_to_front(v)
+        actual = voucher_id_map.get(v.voucher_id, v.voucher_id)
+        vf["voucher_id"] = actual
+        voucher_fronts.append(vf)
     last_voucher_front = voucher_fronts[-1] if voucher_fronts else {}
-    last_voucher_id = vouchers[-1].voucher_id if vouchers else ""
+    last_voucher_id = last_voucher_front.get("voucher_id", "") if voucher_fronts else ""
     yield _sse({"type": "result", **{
         "reply": reply, "session_id": session_id,
         "file": {"name": file.filename, "size_kb": round(file_info["size"] / 1024, 1)},
