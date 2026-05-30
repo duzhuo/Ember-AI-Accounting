@@ -4,9 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="theme-color" content="#2563eb">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#f97316">
     <title>Ember 智能记账</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='40 10 176 210'><path d='M128 24c0 0-60 72-60 120a60 60 0 0 0 120 0c0-48-60-120-60-120z' fill='%23f97316' stroke='none'/><path d='M128 204a32 32 0 0 0 32-32c0-24-32-56-32-56s-32 32-32 56a32 32 0 0 0 32 32z' fill='%23ffffff' opacity='0.4' stroke='none'/></svg>">
+    <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='40 10 176 210'><path d='M128 24c0 0-60 72-60 120a60 60 0 0 0 120 0c0-48-60-120-60-120z' fill='%23f97316' stroke='none'/><path d='M128 204a32 32 0 0 0 32-32c0-24-32-56-32-56s-32 32-32 56a32 32 0 0 0 32 32z' fill='%23ffffff' opacity='0.4' stroke='none'/></svg>">
     <link rel="stylesheet" href="mobile.css">
 </head>
 <body>
@@ -64,6 +66,10 @@
             <div class="action-card" id="action-list">
                 <div class="ac-icon green">📋</div>
                 <span>凭证列表</span>
+            </div>
+            <div class="action-card" id="action-notifications">
+                <div class="ac-icon amber" style="position:relative;">🔔<span class="mobile-notif-badge" id="mobileNotifBadge" style="display:none;">0</span></div>
+                <span>消息通知</span>
             </div>
         </div>
 
@@ -193,6 +199,7 @@
         <div class="filter-tabs">
             <button class="filter-tab active" data-filter="all">全部</button>
             <button class="filter-tab" data-filter="draft">草稿</button>
+            <button class="filter-tab" data-filter="pending_approval">待审批</button>
             <button class="filter-tab" data-filter="posted">已过账</button>
             <button class="filter-tab" data-filter="reversed">已冲销</button>
         </div>
@@ -203,6 +210,51 @@
             <div class="le-icon">📭</div>
             暂无凭证记录
         </div>
+    </div>
+</div>
+
+<!-- ── 通知列表页 ──────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-notifications">
+    <nav class="top-nav">
+        <button class="nav-back" id="notif-nav-back">‹</button>
+        <h2>消息通知</h2>
+        <button class="nav-action" id="notif-mark-all">全部已读</button>
+    </nav>
+
+    <div class="notif-content">
+        <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">全部</button>
+            <button class="filter-tab" data-filter="unread">未读</button>
+        </div>
+
+        <div class="notif-list" id="notif-list"></div>
+
+        <div class="list-empty" id="notif-empty">
+            <div class="le-icon">🔔</div>
+            暂无通知
+        </div>
+    </div>
+</div>
+
+<!-- ── 审批详情页 ──────────────────────────────────────────────────────────── -->
+<div class="screen" id="screen-approval">
+    <nav class="top-nav">
+        <button class="nav-back" id="approval-nav-back">‹</button>
+        <h2>审批凭证</h2>
+    </nav>
+
+    <div class="approval-content">
+        <div class="voucher-header-card" id="approval-summary"></div>
+
+        <div class="approval-comment-area">
+            <label for="approval-comment">审批意见（驳回时必填）</label>
+            <textarea id="approval-comment" placeholder="请输入审批意见..." rows="3"></textarea>
+        </div>
+    </div>
+
+    <div class="action-bar">
+        <button class="btn btn-danger" id="btn-reject">✗ 驳回</button>
+        <button class="btn btn-success" id="btn-approve">✓ 通过</button>
     </div>
 </div>
 

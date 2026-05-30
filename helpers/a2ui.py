@@ -333,19 +333,48 @@ def _users_to_a2ui(users: list) -> dict:
         {"key": "display_name", "label": "显示名称"},
         {"key": "role", "label": "角色"},
         {"key": "created_at", "label": "创建时间"},
+        {"key": "actions", "label": "操作", "align": "center", "width": "120px"},
     ]
     table_rows = []
+    role_labels = {"admin": "管理员", "reviewer": "复核人", "user": "普通用户"}
     for u in users:
         table_rows.append({
+            "user_id": u.get("id", ""),
             "username": u.get("username", ""),
             "display_name": u.get("display_name", ""),
-            "role": "管理员" if u.get("role") == "admin" else "普通用户",
+            "role": role_labels.get(u.get("role"), "普通用户"),
             "created_at": u.get("created_at", ""),
+            "actions": "",  # Will be rendered by actionColumns
         })
+
+    # Action column definitions
+    action_columns = {
+        "actions": [
+            {
+                "label": "编辑",
+                "icon": '<svg width="16" height="16" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M180 40l36 36-128 128H52v-36L180 40z" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                "tooltip": "编辑用户",
+                "action": {"event": {"name": "user_edit", "data": {"user_id": "{user_id}", "username": "{username}"}}}
+            },
+            {
+                "label": "重置密码",
+                "icon": '<svg width="16" height="16" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><rect x="48" y="120" width="160" height="112" rx="8"/><path d="M88 120V80a40 40 0 0 1 80 0v40" stroke-linecap="round"/><circle cx="128" cy="176" r="16"/></svg>',
+                "tooltip": "重置密码",
+                "action": {"event": {"name": "user_reset_password", "data": {"user_id": "{user_id}", "username": "{username}"}}}
+            },
+            {
+                "label": "删除",
+                "icon": '<svg width="16" height="16" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M48 72h160M104 72V48h48v24M56 72l16 136h112l16-136" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                "tooltip": "删除用户",
+                "action": {"event": {"name": "user_delete", "data": {"user_id": "{user_id}", "username": "{username}"}}}
+            },
+        ]
+    }
 
     components = [
         {"id": "title", "component": "Text", "text": f"用户管理（共 {len(users)} 人）", "variant": "h2"},
         {"id": "users-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows},
+         "columns": table_columns, "rows": table_rows,
+         "actionColumns": action_columns},
     ]
     return _build_a2ui_messages("users", components)

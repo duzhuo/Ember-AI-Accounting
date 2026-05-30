@@ -9,6 +9,7 @@ from helpers.auth import _require_auth
 from database import (
     add_audit_log,
     approve_voucher,
+    create_notification,
     get_approval_record,
     get_voucher_record,
     list_pending_approvals,
@@ -49,7 +50,15 @@ async def submit_for_approval(voucher_id: str, payload: dict, request: Request):
         return JSONResponse({"status": "posted", "message": f"凭证 {voucher_id} 已直接过账"})
 
     if not approver_id:
-        return JSONResponse({"error": "请指定审批人"}, status_code=400)
+        return JSONResponse({"error": "请指定复核人"}, status_code=400)
+
+    # Validate approver is a reviewer
+    all_users = await list_users()
+    approver = next((u for u in all_users if u["id"] == approver_id), None)
+    if not approver:
+        return JSONResponse({"error": "复核人不存在"}, status_code=400)
+    if approver.get("role") not in ("reviewer", "admin"):
+        return JSONResponse({"error": "所选用户没有复核权限，请选择复核人"}, status_code=400)
 
     ok = await submit_voucher_for_approval(voucher_id, user["id"], approver_id)
     if not ok:
@@ -59,6 +68,18 @@ async def submit_for_approval(voucher_id: str, payload: dict, request: Request):
         action="voucher.submit_approval", user_id=user["id"], username=user["username"],
         target_type="voucher", target_id=voucher_id, details={"approver_id": approver_id},
     )
+
+    # Notify the approver
+    header = record.get("header_text") or voucher_id
+    await create_notification(
+        user_id=approver_id,
+        type="approval_request",
+        title="新凭证待审批",
+        body=f"{user.get('display_name', user['username'])} 提交了凭证 {voucher_id}（{header}）等待您审批",
+        target_type="voucher",
+        target_id=voucher_id,
+    )
+
     return JSONResponse({"status": "pending_approval", "message": f"凭证 {voucher_id} 已提交审批"})
 
 
@@ -76,8 +97,11 @@ async def approve(voucher_id: str, payload: dict, request: Request):
     approval = await get_approval_record(voucher_id)
     if not approval:
         return JSONResponse({"error": "未找到审批记录"}, status_code=404)
-    if approval.get("approver_id") != user["id"] and user["role"] != "admin":
-        return JSONResponse({"error": "您不是此凭证的指定审批人"}, status_code=403)
+    # Only designated reviewer can approve (admin cannot)
+    if approval.get("approver_id") != user["id"]:
+        return JSONResponse({"error": "您不是此凭证的指定复核人"}, status_code=403)
+    if user["role"] != "reviewer":
+        return JSONResponse({"error": "只有复核人才能审批凭证"}, status_code=403)
 
     comment = payload.get("comment", "")
     ok = await approve_voucher(voucher_id, user["id"], comment)
@@ -93,6 +117,18 @@ async def approve(voucher_id: str, payload: dict, request: Request):
         action="voucher.approve", user_id=user["id"], username=user["username"],
         target_type="voucher", target_id=voucher_id, details={"comment": comment},
     )
+
+    # Notify the submitter
+    header = record.get("header_text") or voucher_id
+    await create_notification(
+        user_id=record["user_id"],
+        type="approval_approved",
+        title="凭证审批通过",
+        body=f"您提交的凭证 {voucher_id}（{header}）已由 {user.get('display_name', user['username'])} 审批通过",
+        target_type="voucher",
+        target_id=voucher_id,
+    )
+
     return JSONResponse({"status": "posted", "message": f"凭证 {voucher_id} 已审批通过并过账"})
 
 
@@ -110,8 +146,11 @@ async def reject(voucher_id: str, payload: dict, request: Request):
     approval = await get_approval_record(voucher_id)
     if not approval:
         return JSONResponse({"error": "未找到审批记录"}, status_code=404)
-    if approval.get("approver_id") != user["id"] and user["role"] != "admin":
-        return JSONResponse({"error": "您不是此凭证的指定审批人"}, status_code=403)
+    # Only designated reviewer can reject (admin cannot)
+    if approval.get("approver_id") != user["id"]:
+        return JSONResponse({"error": "您不是此凭证的指定复核人"}, status_code=403)
+    if user["role"] != "reviewer":
+        return JSONResponse({"error": "只有复核人才能驳回凭证"}, status_code=403)
 
     comment = payload.get("comment", "")
     if not comment:
@@ -125,6 +164,19 @@ async def reject(voucher_id: str, payload: dict, request: Request):
         action="voucher.reject", user_id=user["id"], username=user["username"],
         target_type="voucher", target_id=voucher_id, details={"comment": comment},
     )
+
+    # Notify the submitter
+    header = record.get("header_text") or voucher_id
+    reason_text = f"，原因：{comment}" if comment else ""
+    await create_notification(
+        user_id=record["user_id"],
+        type="approval_rejected",
+        title="凭证被驳回",
+        body=f"您提交的凭证 {voucher_id}（{header}）被 {user.get('display_name', user['username'])} 驳回{reason_text}",
+        target_type="voucher",
+        target_id=voucher_id,
+    )
+
     return JSONResponse({"status": "draft", "message": f"凭证 {voucher_id} 已驳回，请修改后重新提交"})
 
 
@@ -138,12 +190,12 @@ async def list_my_pending(request: Request):
 
 @router.get("/api/users/approvers")
 async def list_approvers(request: Request):
-    """List all users who can serve as approvers (excluding self)."""
+    """List all users with reviewer role who can serve as approvers (excluding self)."""
     user = await _require_auth(request)
     all_users = await list_users()
     approvers = [
-        {"id": u["id"], "username": u["username"], "display_name": u.get("display_name", u["username"])}
+        {"id": u["id"], "username": u["username"], "display_name": u.get("display_name", u["username"]), "role": u.get("role")}
         for u in all_users
-        if u["id"] != user["id"]
+        if u["id"] != user["id"] and u.get("role") in ("reviewer", "admin")
     ]
     return JSONResponse({"approvers": approvers})

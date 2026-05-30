@@ -1,5 +1,6 @@
 """File upload route — Excel/image/PDF → parse → LLM → voucher draft."""
 
+import asyncio
 import json
 import logging
 import shutil
@@ -167,6 +168,11 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
         reply = f"已从{source_label}中识别出1笔{biz_label}交易，生成了1张凭证草稿。"
         await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_id": actual_vid})
 
+        if not session.get("title"):
+            txn_name = getattr(txn, 'customer_name', '') or ''
+            session["title"] = f"{source_label}·{biz_label}" + (f"·{txn_name}" if txn_name else "")
+            _save_session(session_id, session)
+
         attachments = await list_attachments(actual_vid)
         yield _sse({"type": "result", **{
             "reply": reply, "session_id": session_id,
@@ -239,6 +245,10 @@ async def _upload_file_impl(request: Request, file: UploadFile, session_id: str 
     export_sap_csv(vouchers, output_path)
 
     await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="upload", metadata={"voucher_count": len(vouchers)})
+
+    if not session.get("title"):
+        session["title"] = f"Excel导入·{len(vouchers)}张凭证"
+        _save_session(session_id, session)
 
     voucher_fronts = []
     for v in vouchers:

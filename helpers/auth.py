@@ -121,13 +121,14 @@ def _load_session(session_id: str, user_id: str | None = None) -> dict[str, Any]
             return raw
         except Exception:
             pass
-    return {"vouchers": [], "uploaded_files": [], "user_id": user_id}
+    return {"vouchers": [], "uploaded_files": [], "user_id": user_id, "title": None}
 
 
 def _save_session(session_id: str, session: dict[str, Any]) -> None:
     path = _session_path(session_id)
     data = {
         "user_id": session.get("user_id"),
+        "title": session.get("title"),
         "vouchers": [_voucher_to_json(v) for v in session.get("vouchers", [])],
         "uploaded_files": session.get("uploaded_files", []),
     }

@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     password_salt TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'user',  -- 'user' or 'admin'
+    role TEXT NOT NULL DEFAULT 'user',  -- 'user', 'admin', or 'reviewer'
     is_active INTEGER NOT NULL DEFAULT 1,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
@@ -206,6 +206,21 @@ CREATE TABLE IF NOT EXISTS approval_records (
 );
 CREATE INDEX IF NOT EXISTS idx_approval_records_approver ON approval_records(approver_id);
 CREATE INDEX IF NOT EXISTS idx_approval_records_status ON approval_records(status);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    target_type TEXT,
+    target_id TEXT,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, is_read);
 """
 
 
@@ -245,6 +260,28 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE voucher_records ADD COLUMN reversal_reason TEXT")
             await db.commit()
             logger.info("Migration: added reversal columns to voucher_records")
+
+        # Migration: create notifications table if missing
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='notifications'")
+        if not await cursor.fetchone():
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    target_type TEXT,
+                    target_id TEXT,
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+                CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, is_read);
+            """)
+            await db.commit()
+            logger.info("Migration: created notifications table")
 
         # Create default admin user if no users exist
         cursor = await db.execute("SELECT COUNT(*) FROM users")
@@ -427,14 +464,17 @@ async def update_user(user_id: str, **kwargs) -> bool:
     """Update user fields. Returns True if updated."""
     allowed = {"display_name", "role", "is_active"}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
-    if not fields:
-        return False
 
     # Handle password update separately
     if "password" in kwargs and kwargs["password"]:
         hashed, salt = _hash_password(kwargs["password"])
         fields["password_hash"] = hashed
         fields["password_salt"] = salt
+        # Clear must_change_password flag when password is set
+        fields["must_change_password"] = 0
+
+    if not fields:
+        return False
 
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [user_id]
@@ -1456,5 +1496,105 @@ async def list_pending_approvals(approver_id: str) -> list[dict]:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+# ── Notification operations ──────────────────────────────────────────────────
+
+
+async def create_notification(
+    user_id: str, type: str, title: str, body: str,
+    target_type: str | None = None, target_id: str | None = None,
+) -> str:
+    """Create a notification. Returns the notification ID."""
+    notif_id = str(uuid.uuid4())
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO notifications (id, user_id, type, title, body, target_type, target_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (notif_id, user_id, type, title, body, target_type, target_id, datetime.now().isoformat()),
+        )
+        await db.commit()
+        return notif_id
+    finally:
+        await db.close()
+
+
+async def list_notifications(user_id: str, limit: int = 50, unread_only: bool = False) -> list[dict]:
+    """List notifications for a user, newest first."""
+    db = await get_db()
+    try:
+        where = "WHERE n.user_id = ?"
+        params: list = [user_id]
+        if unread_only:
+            where += " AND n.is_read = 0"
+        cursor = await db.execute(
+            f"""SELECT n.*
+                FROM notifications n
+                {where}
+                ORDER BY n.created_at DESC
+                LIMIT ?""",
+            params + [limit],
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def count_unread_notifications(user_id: str) -> int:
+    """Count unread notifications for a user."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+    finally:
+        await db.close()
+
+
+async def mark_notification_read(notification_id: str, user_id: str) -> bool:
+    """Mark a single notification as read."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
+            (notification_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def mark_all_notifications_read(user_id: str) -> int:
+    """Mark all notifications as read for a user. Returns count of updated rows."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
+            (user_id,),
+        )
+        await db.commit()
+        return cursor.rowcount
+    finally:
+        await db.close()
+
+
+async def delete_notification(notification_id: str, user_id: str) -> bool:
+    """Delete a notification."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "DELETE FROM notifications WHERE id = ? AND user_id = ?",
+            (notification_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
     finally:
         await db.close()

@@ -1,5 +1,6 @@
 """Chat API route — natural language → LLM → voucher draft."""
 
+import asyncio
 import json
 import logging
 import secrets
@@ -40,6 +41,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _generate_session_title(session_id: str, session: dict, first_message: str):
+    """Generate a short title for the session using LLM (background task)."""
+    from agents.model_factory import create_chat_model
+    from agentscope.message import UserMsg
+    try:
+        model = create_chat_model()
+        prompt = f"为以下对话生成一个简短的标题（不超过15个字，不要引号和标点）：\n用户：{first_message}"
+        msg = UserMsg(name="user", content=prompt)
+        result = await model.reply(msg)
+        title = result.text.strip().strip('"').strip("'").strip("《》")
+        if len(title) > 20:
+            title = title[:20]
+        session["title"] = title
+        _save_session(session_id, session)
+        logger.info("Generated session title: %s", title)
+    except Exception as exc:
+        logger.warning("Failed to generate session title: %s", exc)
+        # Fallback: use truncated first message
+        title = first_message.split("\n")[0][:15]
+        session["title"] = title
+        _save_session(session_id, session)
+
+
 @router.post("/api/chat")
 async def chat_endpoint(payload: dict, request: Request):
     return StreamingResponse(_chat_stream(payload, request), media_type="text/event-stream")
@@ -75,6 +99,10 @@ async def _chat_stream(payload: dict, request: Request):
         session_id=chat_session_id, user_id=user["id"],
         role="user", content=message, message_type="chat",
     )
+
+    # Generate session title in background if not set
+    if not session.get("title"):
+        asyncio.create_task(_generate_session_title(session_id, session, message))
 
     recent_history = await list_chat_messages(session_id=chat_session_id, limit=200)
     history_for_llm = [{"role": m["role"], "content": m["content"]} for m in recent_history]
@@ -155,6 +183,8 @@ async def _chat_stream(payload: dict, request: Request):
         msg_lower = message.lower()
         voucher_keywords = ["查看凭证", "凭证记录", "我的凭证", "凭证列表", "已生成凭证", "看看凭证", "查凭证"]
         user_mgmt_keywords = ["添加用户", "新建用户", "创建用户", "增加用户"]
+        user_query_keywords = ["查询用户", "用户列表", "查看用户", "用户管理", "所有用户"]
+        user_password_keywords = ["密码", "password", "默认密码", "初始密码", "密码是什么", "密码多少"]
         rule_mgmt_keywords = ["新增规则", "添加规则", "创建规则", "建立规则", "修改规则", "更新规则", "删除规则", "去掉规则",
                               "新增凭证规则", "添加凭证规则", "创建凭证规则"]
         rule_mgmt_action_keywords = ["新增", "添加", "创建", "建立", "修改", "更新", "删除", "去掉"]
@@ -175,6 +205,29 @@ async def _chat_stream(payload: dict, request: Request):
         elif any(kw in msg_lower for kw in user_mgmt_keywords):
             parse_result = {"intent": "user_mgmt", "action": "create", "new_username": None, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
             logger.info("Keyword fallback: chat → user_mgmt for '%s'", message[:60])
+        elif any(kw in msg_lower for kw in user_query_keywords):
+            parse_result = {"intent": "user_mgmt", "action": "list", "new_username": None, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → user_mgmt (list) for '%s'", message[:60])
+        elif any(kw in msg_lower for kw in user_password_keywords):
+            # Extract username from message or recent context
+            username = None
+            all_users = await list_users()
+            for u in all_users:
+                if u["username"] in message or u.get("display_name", "") in message:
+                    username = u["username"]
+                    break
+            # If not found in current message, check recent history
+            if not username and recent_history:
+                for hist in recent_history[:5]:
+                    content = hist.get("content", "")
+                    for u in all_users:
+                        if u["username"] in content or u.get("display_name", "") in content:
+                            username = u["username"]
+                            break
+                    if username:
+                        break
+            parse_result = {"intent": "user_mgmt", "action": "query_password", "new_username": username, "new_display_name": None, "new_role": "user", "new_password": None, "reply": reply, "business_type": None, "transaction": None}
+            logger.info("Keyword fallback: chat → user_mgmt (query_password) for '%s'", message[:60])
         elif any(kw in msg_lower for kw in rule_mgmt_keywords):
             detected_type = None
             for kw, biz_type in biz_type_map.items():
@@ -212,6 +265,13 @@ async def _chat_stream(payload: dict, request: Request):
 
     # Handle rule_query intent
     if parse_result.get("intent") == "rule_query":
+        # Admin cannot view rules
+        if user["role"] == "admin":
+            reply = "抱歉，管理员没有查看凭证规则的权限。"
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
+
         rule_type = parse_result.get("rule_type")
         reply = parse_result.get("reply", "")
         await add_audit_log(
@@ -318,10 +378,18 @@ async def _chat_stream(payload: dict, request: Request):
 
     # Handle voucher_query intent
     if parse_result.get("intent") == "voucher_query":
+        # Admin cannot query vouchers
+        if user["role"] == "admin":
+            reply = "抱歉，管理员没有查看凭证的权限。"
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
+
         try:
             status_filter = parse_result.get("status")
             reply = parse_result.get("reply", "")
-            user_id = None if user["role"] == "admin" else user["id"]
+            # Reviewer can see all vouchers, user can only see their own
+            user_id = None if user["role"] == "reviewer" else user["id"]
             records = await list_voucher_records(user_id=user_id, status=status_filter, limit=50, offset=0)
             total = await count_voucher_records(user_id=user_id, status=status_filter)
             logger.info("voucher_query: user=%s status=%s records=%d total=%d", user["username"], status_filter, len(records), total)
@@ -364,11 +432,75 @@ async def _chat_stream(payload: dict, request: Request):
     if parse_result.get("intent") == "user_mgmt":
         reply = parse_result.get("reply", "")
         if user["role"] != "admin":
-            reply = "抱歉，只有管理员才能添加用户。"
+            reply = "抱歉，只有管理员才能管理用户。"
             await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
             yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
             return
-        action = parse_result.get("action", "create")
+        action = parse_result.get("action")
+        new_username = parse_result.get("new_username", "").strip() if parse_result.get("new_username") else ""
+
+        # If no action specified and no username, default to list
+        if not action and not new_username:
+            action = "list"
+
+        # Handle list action
+        if action == "list":
+            users = await list_users()
+            for u in users:
+                u.pop("password_hash", None)
+                u.pop("password_salt", None)
+            if not reply:
+                reply = f"当前共有 {len(users)} 个用户。"
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+            yield _sse({"type": "result", **{
+                "reply": reply, "session_id": session_id, "view": "user_list",
+                "view_data": {"users": users},
+                "a2ui": {"messages": _users_to_a2ui(users)},
+            }})
+            return
+
+        # Handle query_password action
+        if action == "query_password":
+            target_username = parse_result.get("new_username", "").strip()
+            if not target_username:
+                # Try to find username from recent context
+                if recent_history:
+                    for hist in recent_history[:5]:
+                        content = hist.get("content", "")
+                        all_users = await list_users()
+                        for u in all_users:
+                            if u["username"] in content or u.get("display_name", "") in content:
+                                target_username = u["username"]
+                                break
+                        if target_username:
+                            break
+
+            if not target_username:
+                reply = "请指定要查询密码的用户名。例如：「zhangsan的密码是什么」"
+                await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+                yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+                return
+
+            # Find the user
+            all_users = await list_users()
+            target_user = next((u for u in all_users if u["username"] == target_username), None)
+            if not target_user:
+                reply = f"未找到用户「{target_username}」。"
+                await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+                yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+                return
+
+            # Check if password was set (we can't retrieve the actual password, but we can check if it's the default)
+            # For security, we don't store plain text passwords. We can only tell if the user has must_change_password flag
+            if target_user.get("must_change_password"):
+                reply = f"用户「{target_username}」的密码是系统生成的默认密码，尚未修改。\n\n默认密码格式为：`User@` + 随机字符\n\n建议用户登录后立即修改密码。"
+            else:
+                reply = f"用户「{target_username}」已经修改过密码，无法查看原始密码。\n\n如果需要重置密码，请联系管理员。"
+
+            await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+            yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+            return
+
         if action == "create":
             new_username = parse_result.get("new_username", "").strip()
             new_display_name = parse_result.get("new_display_name") or new_username
@@ -401,7 +533,7 @@ async def _chat_stream(payload: dict, request: Request):
                 target_type="user", target_id=created["id"],
                 details={"new_username": new_username, "new_role": new_role},
             )
-            role_label = "管理员" if new_role == "admin" else "普通用户"
+            role_label = {"admin": "管理员", "reviewer": "复核人", "user": "普通用户"}.get(new_role, "普通用户")
             if not reply:
                 reply = f"已成功创建用户：\n• 用户名：{new_username}\n• 显示名称：{new_display_name}\n• 角色：{role_label}\n• 密码：{new_password}\n\n请通知用户尽快修改密码。"
             await save_chat_message(
@@ -425,7 +557,13 @@ async def _chat_stream(payload: dict, request: Request):
         yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
         return
 
-    # Voucher generation
+    # Voucher generation - only user and reviewer can generate vouchers
+    if user["role"] == "admin":
+        reply = "抱歉，管理员没有生成凭证的权限。"
+        await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
+        yield _sse({"type": "result", **{"reply": reply, "session_id": session_id}})
+        return
+
     business_type = parse_result["business_type"]
     txn = parse_result["transaction"]
 

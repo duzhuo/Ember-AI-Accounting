@@ -52,6 +52,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rule_edit:   { title: '编辑规则',       showHeader: true, icon: 'ph-pencil-simple' },
         user_list:   { title: '用户管理',       showHeader: true, icon: 'ph-users' },
         dynamic:     { title: '',              showHeader: false },
+        notifications:{ title: '消息通知',      showHeader: true },
     };
 
     function switchView(viewName, options = {}) {
@@ -72,6 +73,7 @@ document.addEventListener('DOMContentLoaded', () => {
                        : viewName === 'rule_edit' ? 'viewRuleEdit'
                        : viewName === 'voucher' ? 'viewVoucher'
                        : viewName === 'dynamic' ? 'viewDynamic'
+                       : viewName === 'notifications' ? 'viewNotifications'
                        : 'viewEmpty';
         const target = document.getElementById(targetId);
         if (target) target.classList.add('active');
@@ -135,6 +137,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 sessionId = null;
                 chatHistory.innerHTML = '';
                 showApp();
+                startNotificationPolling();
             } else {
                 handleLogout();
             }
@@ -152,7 +155,36 @@ document.addEventListener('DOMContentLoaded', () => {
         loginOverlay.style.display = 'none';
         appContainer.style.display = 'grid';
         userDisplayName.textContent = currentUser.display_name || currentUser.username;
+
+        // Apply role-based UI visibility
+        applyRolePermissions();
+
         loadChatHistory();
+    }
+
+    function applyRolePermissions() {
+        const role = currentUser?.role;
+
+        // Hide/show elements based on role
+        // Admin: only user management
+        // Reviewer: voucher approval, rules viewing
+        // User: voucher creation, rules viewing
+
+        // Update sidebar hint cards based on role
+        const hintCards = document.querySelectorAll('.hint-card');
+        hintCards.forEach(card => {
+            const hint = card.dataset.hint || '';
+            if (role === 'admin') {
+                // Admin can only manage users
+                card.style.display = hint.includes('用户') ? '' : 'none';
+            } else if (role === 'reviewer') {
+                // Reviewer can view vouchers and rules, but not create
+                card.style.display = (hint.includes('凭证') || hint.includes('规则')) ? '' : 'none';
+            } else {
+                // User can do everything except user management
+                card.style.display = hint.includes('用户') ? 'none' : '';
+            }
+        });
     }
 
     async function loadChatHistory() {
@@ -209,6 +241,7 @@ document.addEventListener('DOMContentLoaded', () => {
             chatHistory.innerHTML = '';
             if (voucherWorkspaceContent) voucherWorkspaceContent.style.display = 'none';
             showApp();
+            startNotificationPolling();
 
             if (data.user.must_change_password) {
                 showChangePasswordModal(true);
@@ -223,6 +256,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     function handleLogout() {
+        stopNotificationPolling();
         authToken = null;
         currentUser = null;
         sessionId = null;
@@ -244,6 +278,310 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch {}
         handleLogout();
     });
+
+    // ── New Chat ─────────────────────────────────────────────────────────────
+
+    const newChatBtn = document.getElementById('newChatBtn');
+    newChatBtn.addEventListener('click', () => {
+        sessionId = null;
+        chatHistory.innerHTML = '';
+        if (voucherWorkspaceContent) voucherWorkspaceContent.style.display = 'none';
+    });
+
+    // ── Chat History ─────────────────────────────────────────────────────────
+
+    const historyBtn = document.getElementById('historyBtn');
+    let _currentSessionId = null; // track the active session for "back" navigation
+
+    historyBtn.addEventListener('click', async () => {
+        _currentSessionId = sessionId;
+        try {
+            const resp = await apiFetch('/api/my-sessions?limit=30');
+            const data = await resp.json();
+            renderSessionList(data.sessions || []);
+        } catch {
+            chatHistory.innerHTML = '<div class="message ai-message"><div class="avatar"><svg width="20" height="20" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M45.42 177.69C28.86 165.81 20 148 20 128s8.86-37.81 25.42-49.69C62.78 65.31 93.06 60 128 60s65.22 5.31 82.58 18.31C227.14 90.19 236 108 236 128s-8.86 37.81-25.42 49.69C193.22 190.69 162.94 196 128 196c-11.29 0-21.9-.77-31.68-2.24-6.29 14.46-18.1 28.27-43.77 34.05a12.11 12.11 0 0 1-14.27-15.42c3.89-12.78 5.48-26.08 7.14-40.7Z" stroke-linecap="round" stroke-linejoin="round"/><line x1="88" y1="128" x2="168" y2="128"/><line x1="128" y1="88" x2="128" y2="168"/></svg></div><div class="content"><p>加载历史记录失败</p></div></div>';
+        }
+    });
+
+    function renderSessionList(sessions) {
+        chatHistory.innerHTML = '';
+        if (sessions.length === 0) {
+            chatHistory.innerHTML = '<div class="message ai-message"><div class="avatar"><svg width="20" height="20" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M45.42 177.69C28.86 165.81 20 148 20 128s8.86-37.81 25.42-49.69C62.78 65.31 93.06 60 128 60s65.22 5.31 82.58 18.31C227.14 90.19 236 108 236 128s-8.86 37.81-25.42 49.69C193.22 190.69 162.94 196 128 196c-11.29 0-21.9-.77-31.68-2.24-6.29 14.46-18.1 28.27-43.77 34.05a12.11 12.11 0 0 1-14.27-15.42c3.89-12.78 5.48-26.08 7.14-40.7Z" stroke-linecap="round" stroke-linejoin="round"/><line x1="88" y1="128" x2="168" y2="128"/><line x1="128" y1="88" x2="128" y2="168"/></svg></div><div class="content"><p>暂无历史对话</p></div></div>';
+            return;
+        }
+
+        // Back button
+        const backDiv = document.createElement('div');
+        backDiv.className = 'session-back-btn';
+        backDiv.innerHTML = '<svg width="14" height="14" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="20"><polyline points="160,40 64,128 160,216" stroke-linecap="round" stroke-linejoin="round"/></svg> 返回当前对话';
+        backDiv.addEventListener('click', () => {
+            if (_currentSessionId) {
+                loadSessionMessages(_currentSessionId);
+            } else {
+                chatHistory.innerHTML = '';
+            }
+        });
+        chatHistory.appendChild(backDiv);
+
+        // Session list
+        const listDiv = document.createElement('div');
+        listDiv.className = 'session-list';
+        for (const s of sessions) {
+            const item = document.createElement('div');
+            item.className = 'session-item';
+            const time = s.last_message_at ? new Date(s.last_message_at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+            item.innerHTML = `<div class="session-item-preview">${(s.title || '(无内容)').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div><div class="session-item-meta">${time} · ${s.message_count} 条消息</div>`;
+            item.addEventListener('click', () => loadSessionMessages(s.session_id));
+            listDiv.appendChild(item);
+        }
+        chatHistory.appendChild(listDiv);
+    }
+
+    async function loadSessionMessages(sid) {
+        try {
+            const resp = await apiFetch(`/api/my-chat-history?session_id=${encodeURIComponent(sid)}&limit=200`);
+            const data = await resp.json();
+            sessionId = data.session_id;
+            chatHistory.innerHTML = '';
+            for (const m of (data.messages || [])) {
+                addMessage(m.content, m.role === 'user' ? 'user' : 'ai');
+            }
+        } catch {
+            addMessage('加载对话失败', 'ai');
+        }
+    }
+
+    // ── Notifications ──────────────────────────────────────────────────────────
+
+    const notificationBtn = document.getElementById('notificationBtn');
+    const notificationBadge = document.getElementById('notificationBadge');
+    const notificationContent = document.getElementById('notificationContent');
+    let _notifFilter = 'all'; // 'all' or 'unread'
+    let _notifPollTimer = null;
+
+    notificationBtn.addEventListener('click', async () => {
+        switchView('notifications');
+        await loadNotifications();
+    });
+
+    async function loadNotifications() {
+        try {
+            const url = `/api/notifications?limit=50${_notifFilter === 'unread' ? '&unread_only=true' : ''}`;
+            const resp = await apiFetch(url);
+            const data = await resp.json();
+            renderNotifications(data.notifications || []);
+        } catch {
+            notificationContent.innerHTML = '<div class="notification-empty"><svg width="48" height="48" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M96 192a32 32 0 0 0 64 0" stroke-linecap="round"/><path d="M56 96a72 72 0 0 1 144 0c0 35.86 8 58.37 16 72H40c8-13.63 16-36.14 16-72z" stroke-linecap="round"/></svg><p>加载通知失败</p></div>';
+        }
+    }
+
+    function renderNotifications(items) {
+        notificationContent.innerHTML = '';
+
+        // Toolbar
+        const toolbar = document.createElement('div');
+        toolbar.className = 'notification-toolbar';
+        toolbar.innerHTML = `
+            <div class="notification-filters">
+                <button class="notification-filter-btn ${_notifFilter === 'all' ? 'active' : ''}" data-filter="all">全部</button>
+                <button class="notification-filter-btn ${_notifFilter === 'unread' ? 'active' : ''}" data-filter="unread">未读</button>
+            </div>
+            <button class="btn btn-sm btn-secondary" id="markAllReadBtn">全部已读</button>
+        `;
+        notificationContent.appendChild(toolbar);
+
+        // Filter buttons
+        toolbar.querySelectorAll('.notification-filter-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                _notifFilter = btn.dataset.filter;
+                await loadNotifications();
+            });
+        });
+
+        // Mark all read
+        toolbar.querySelector('#markAllReadBtn').addEventListener('click', async () => {
+            try {
+                await apiFetch('/api/notifications/read-all', { method: 'POST' });
+                await loadNotifications();
+                await updateNotificationBadge();
+            } catch {}
+        });
+
+        // List
+        if (items.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'notification-empty';
+            empty.innerHTML = '<svg width="48" height="48" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M96 192a32 32 0 0 0 64 0" stroke-linecap="round"/><path d="M56 96a72 72 0 0 1 144 0c0 35.86 8 58.37 16 72H40c8-13.63 16-36.14 16-72z" stroke-linecap="round"/></svg><p>暂无通知</p>';
+            notificationContent.appendChild(empty);
+            return;
+        }
+
+        const list = document.createElement('div');
+        list.className = 'notification-list';
+        for (const n of items) {
+            const item = document.createElement('div');
+            item.className = `notification-item${n.is_read ? '' : ' unread'}`;
+            const iconSvg = getNotificationIcon(n.type);
+            const time = n.created_at ? new Date(n.created_at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+            item.innerHTML = `
+                <div class="notification-icon type-${n.type}">${iconSvg}</div>
+                <div class="notification-body">
+                    <div class="notification-title">${escHtml(n.title)}</div>
+                    <div class="notification-text">${escHtml(n.body)}</div>
+                    <div class="notification-time">${time}</div>
+                </div>
+                <button class="notification-delete-btn" title="删除"><svg width="14" height="14" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="20"><line x1="64" y1="64" x2="192" y2="192"/><line x1="192" y1="64" x2="64" y2="192"/></svg></button>
+            `;
+
+            // Click to open
+            item.addEventListener('click', async (e) => {
+                if (e.target.closest('.notification-delete-btn')) return;
+                if (!n.is_read) {
+                    await apiFetch(`/api/notifications/${n.id}/read`, { method: 'POST' });
+                    await updateNotificationBadge();
+                }
+                if (n.target_type === 'voucher' && n.target_id) {
+                    if (n.type === 'approval_request') {
+                        openApprovalModal(n.target_id);
+                    } else {
+                        loadVoucher(n.target_id);
+                    }
+                }
+            });
+
+            // Delete button
+            item.querySelector('.notification-delete-btn').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                try {
+                    await apiFetch(`/api/notifications/${n.id}`, { method: 'DELETE' });
+                    item.remove();
+                    await updateNotificationBadge();
+                } catch {}
+            });
+
+            list.appendChild(item);
+        }
+        notificationContent.appendChild(list);
+    }
+
+    function getNotificationIcon(type) {
+        switch (type) {
+            case 'approval_request':
+                return '<svg width="18" height="18" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><circle cx="128" cy="128" r="96"/><polyline points="128,72 128,128 168,152" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+            case 'approval_approved':
+                return '<svg width="18" height="18" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><circle cx="128" cy="128" r="96"/><polyline points="88,128 112,152 168,96" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+            case 'approval_rejected':
+                return '<svg width="18" height="18" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><circle cx="128" cy="128" r="96"/><line x1="96" y1="96" x2="160" y2="160"/><line x1="160" y1="96" x2="96" y2="160"/></svg>';
+            default:
+                return '<svg width="18" height="18" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><rect x="32" y="64" width="192" height="128" rx="8"/><polyline points="32,64 128,144 224,64" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        }
+    }
+
+    async function updateNotificationBadge() {
+        try {
+            const resp = await apiFetch('/api/notifications/unread-count');
+            const data = await resp.json();
+            const count = data.count || 0;
+            if (count > 0) {
+                notificationBadge.textContent = count > 99 ? '99+' : count;
+                notificationBadge.style.display = 'flex';
+            } else {
+                notificationBadge.style.display = 'none';
+            }
+        } catch {}
+    }
+
+    function startNotificationPolling() {
+        stopNotificationPolling();
+        updateNotificationBadge();
+        _notifPollTimer = setInterval(updateNotificationBadge, 30000);
+    }
+
+    function stopNotificationPolling() {
+        if (_notifPollTimer) {
+            clearInterval(_notifPollTimer);
+            _notifPollTimer = null;
+        }
+    }
+
+    // ── Approval Modal ──────────────────────────────────────────────────────────
+
+    const approvalModal = document.getElementById('approvalModal');
+    const approvalModalClose = document.getElementById('approvalModalClose');
+    const approvalModalCancel = document.getElementById('approvalModalCancel');
+    const approvalApproveBtn = document.getElementById('approvalApproveBtn');
+    const approvalRejectBtn = document.getElementById('approvalRejectBtn');
+    const approvalModalBody = document.getElementById('approvalModalBody');
+    const approvalComment = document.getElementById('approvalComment');
+    let _approvalVoucherId = null;
+
+    approvalModalClose.addEventListener('click', () => { approvalModal.style.display = 'none'; });
+    approvalModalCancel.addEventListener('click', () => { approvalModal.style.display = 'none'; });
+
+    async function openApprovalModal(voucherId) {
+        _approvalVoucherId = voucherId;
+        approvalComment.value = '';
+        approvalModalBody.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-secondary);">加载中...</div>';
+        approvalModal.style.display = 'flex';
+
+        try {
+            const resp = await apiFetch(`/api/vouchers/${voucherId}`);
+            const v = await resp.json();
+            const data = v.voucher_data ? (typeof v.voucher_data === 'string' ? JSON.parse(v.voucher_data) : v.voucher_data) : {};
+            const totalDebit = (data.lines || []).reduce((s, l) => s + (parseFloat(l.debit_amount) || 0), 0);
+            approvalModalBody.innerHTML = `
+                <div class="approval-summary">
+                    <div class="summary-row"><span class="summary-label">凭证号</span><span class="summary-value">${escHtml(v.voucher_id)}</span></div>
+                    <div class="summary-row"><span class="summary-label">摘要</span><span class="summary-value">${escHtml(v.header_text || '-')}</span></div>
+                    <div class="summary-row"><span class="summary-label">金额</span><span class="summary-value">¥${totalDebit.toLocaleString('zh-CN', {minimumFractionDigits: 2})}</span></div>
+                    <div class="summary-row"><span class="summary-label">公司代码</span><span class="summary-value">${escHtml(v.company_code || '-')}</span></div>
+                    <div class="summary-row"><span class="summary-label">凭证日期</span><span class="summary-value">${escHtml(v.document_date || '-')}</span></div>
+                </div>
+            `;
+        } catch {
+            approvalModalBody.innerHTML = '<div style="padding:20px;text-align:center;color:#dc2626;">加载凭证失败</div>';
+        }
+    }
+
+    approvalApproveBtn.addEventListener('click', async () => {
+        if (!_approvalVoucherId) return;
+        try {
+            await apiFetch(`/api/vouchers/${_approvalVoucherId}/approve`, {
+                method: 'POST',
+                body: JSON.stringify({ comment: approvalComment.value }),
+            });
+            approvalModal.style.display = 'none';
+            await updateNotificationBadge();
+            if (currentView === 'notifications') await loadNotifications();
+        } catch (e) {
+            alert(e.message || '审批失败');
+        }
+    });
+
+    approvalRejectBtn.addEventListener('click', async () => {
+        if (!_approvalVoucherId) return;
+        if (!approvalComment.value.trim()) {
+            alert('驳回时必须填写原因');
+            return;
+        }
+        try {
+            await apiFetch(`/api/vouchers/${_approvalVoucherId}/reject`, {
+                method: 'POST',
+                body: JSON.stringify({ comment: approvalComment.value }),
+            });
+            approvalModal.style.display = 'none';
+            await updateNotificationBadge();
+            if (currentView === 'notifications') await loadNotifications();
+        } catch (e) {
+            alert(e.message || '驳回失败');
+        }
+    });
+
+    function escHtml(str) {
+        if (!str) return '';
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
 
     // ── Password Change Modal ────────────────────────────────────────────────
 
@@ -375,9 +713,11 @@ document.addEventListener('DOMContentLoaded', () => {
     function addMessage(content, type = 'ai') {
         const msgDiv = document.createElement('div');
         msgDiv.className = `message ${type}-message`;
-        let icon = type === 'ai' ? 'ph-fire' : 'ph-user';
+        const avatarSvg = type === 'ai'
+            ? '<svg width="20" height="20" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M45.42 177.69C28.86 165.81 20 148 20 128s8.86-37.81 25.42-49.69C62.78 65.31 93.06 60 128 60s65.22 5.31 82.58 18.31C227.14 90.19 236 108 236 128s-8.86 37.81-25.42 49.69C193.22 190.69 162.94 196 128 196c-11.29 0-21.9-.77-31.68-2.24-6.29 14.46-18.1 28.27-43.77 34.05a12.11 12.11 0 0 1-14.27-15.42c3.89-12.78 5.48-26.08 7.14-40.7Z" stroke-linecap="round" stroke-linejoin="round"/><line x1="88" y1="128" x2="168" y2="128"/><line x1="128" y1="88" x2="128" y2="168"/></svg>'
+            : '<svg width="20" height="20" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><circle cx="128" cy="96" r="64"/><path d="M32 216c0-52.94 43.06-96 96-96s96 43.06 96 96" stroke-linecap="round"/></svg>';
         msgDiv.innerHTML = `
-            <div class="avatar"><i class="ph ${icon}"></i></div>
+            <div class="avatar">${avatarSvg}</div>
             <div class="content">${formatContent(content)}</div>
         `;
         chatHistory.appendChild(msgDiv);
@@ -779,6 +1119,7 @@ document.addEventListener('DOMContentLoaded', () => {
             table.className = 'a2ui-table';
             const isSelectable = comp.selectable === true;
             const selectedIds = new Set();
+            const actionColumns = comp.actionColumns || {};
 
             // Header
             const thead = document.createElement('thead');
@@ -827,17 +1168,36 @@ document.addEventListener('DOMContentLoaded', () => {
                             updateBatchBtn();
                         });
                         td.appendChild(cb);
+                    } else if (actionColumns[col.key]) {
+                        // Render action buttons
+                        const actions = actionColumns[col.key];
+                        const btnGroup = document.createElement('div');
+                        btnGroup.className = 'a2ui-action-btn-group';
+                        for (const actionDef of actions) {
+                            const btn = document.createElement('button');
+                            btn.className = 'a2ui-action-btn';
+                            btn.title = actionDef.label || '';
+                            btn.innerHTML = actionDef.icon || '';
+                            if (actionDef.tooltip) btn.setAttribute('data-tooltip', actionDef.tooltip);
+                            btn.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                const action = this.resolveActionTemplate(actionDef.action, row);
+                                this.handleAction(action);
+                            });
+                            btnGroup.appendChild(btn);
+                        }
+                        td.appendChild(btnGroup);
                     } else {
                         td.textContent = row[col.key] ?? '';
                         if (col.align) td.style.textAlign = col.align;
                     }
                     tr.appendChild(td);
                 }
-                // Row click action (but not on checkbox clicks)
+                // Row click action (but not on checkbox or button clicks)
                 if (comp.rowAction) {
                     tr.className = 'a2ui-table-clickable';
                     tr.addEventListener('click', (e) => {
-                        if (e.target.type === 'checkbox') return;
+                        if (e.target.type === 'checkbox' || e.target.closest('.a2ui-action-btn-group')) return;
                         const action = this.resolveActionTemplate(comp.rowAction, row);
                         this.handleAction(action);
                     });
@@ -974,6 +1334,33 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (eventName === 'edit_voucher') {
                     const voucherId = action.event.data?.voucherId;
                     if (voucherId) loadVoucherEditForm(voucherId);
+                    return;
+                }
+
+                // Client-side: user management actions
+                if (eventName === 'user_edit') {
+                    const userId = action.event.data?.user_id;
+                    const username = action.event.data?.username;
+                    if (userId) openEditUserModalById(userId);
+                    return;
+                }
+
+                if (eventName === 'user_reset_password') {
+                    const userId = action.event.data?.user_id;
+                    const username = action.event.data?.username;
+                    if (userId) resetUserPassword(userId, username);
+                    return;
+                }
+
+                if (eventName === 'user_delete') {
+                    const userId = action.event.data?.user_id;
+                    const username = action.event.data?.username;
+                    if (userId && confirm(`确定要删除用户「${username}」吗？`)) {
+                        deleteUser(userId).then(() => {
+                            // Refresh user list via chat
+                            sendMessage('查询所有用户');
+                        });
+                    }
                     return;
                 }
 
@@ -1741,7 +2128,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let rowsHTML = '';
         users.forEach(u => {
-            const roleLabel = u.role === 'admin' ? '<span class="role-badge role-admin">管理员</span>' : '<span class="role-badge role-user">普通用户</span>';
+            const roleLabel = u.role === 'admin' ? '<span class="role-badge role-admin">管理员</span>'
+                            : u.role === 'reviewer' ? '<span class="role-badge role-reviewer">复核人</span>'
+                            : '<span class="role-badge role-user">普通用户</span>';
             const statusLabel = u.is_active ? '<span class="status-badge status-posted">启用</span>' : '<span class="status-badge status-draft">停用</span>';
             const createdAt = new Date(u.created_at).toLocaleString('zh-CN');
 
@@ -1753,8 +2142,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     <td>${statusLabel}</td>
                     <td>${createdAt}</td>
                     <td class="users-actions">
-                        <button class="icon-btn-small edit-user-btn" data-id="${u.id}" data-username="${u.username}" data-display="${u.display_name}" data-role="${u.role}" title="编辑"><i class="ph ph-pencil"></i></button>
-                        <button class="icon-btn-small delete-user-btn" data-id="${u.id}" title="删除"><i class="ph ph-trash"></i></button>
+                        <button class="icon-btn-small edit-user-btn" data-id="${u.id}" data-username="${u.username}" data-display="${u.display_name}" data-role="${u.role}" title="编辑"><svg width="14" height="14" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M180 40l36 36-128 128H52v-36L180 40z" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+                        <button class="icon-btn-small reset-password-btn" data-id="${u.id}" data-username="${u.username}" title="重置密码"><svg width="14" height="14" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><rect x="48" y="120" width="160" height="112" rx="8"/><path d="M88 120V80a40 40 0 0 1 80 0v40" stroke-linecap="round"/><circle cx="128" cy="176" r="16"/></svg></button>
+                        <button class="icon-btn-small delete-user-btn" data-id="${u.id}" title="删除"><svg width="14" height="14" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><path d="M48 72h160M104 72V48h48v24M56 72l16 136h112l16-136" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
                     </td>
                 </tr>
             `;
@@ -1787,6 +2177,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // Bind events
         container.querySelectorAll('.edit-user-btn').forEach(btn => {
             btn.addEventListener('click', () => openEditUserModal(btn.dataset));
+        });
+        container.querySelectorAll('.reset-password-btn').forEach(btn => {
+            btn.addEventListener('click', () => resetUserPassword(btn.dataset.id, btn.dataset.username));
         });
         container.querySelectorAll('.delete-user-btn').forEach(btn => {
             btn.addEventListener('click', () => deleteUser(btn.dataset.id));
@@ -1827,6 +2220,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             <label for="newRole">角色</label>
                             <select id="newRole">
                                 <option value="user">普通用户</option>
+                                <option value="reviewer">复核人</option>
                                 <option value="admin">管理员</option>
                             </select>
                         </div>
@@ -1870,6 +2264,27 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('newRole').value = dataset.role;
     }
 
+    async function openEditUserModalById(userId) {
+        try {
+            const resp = await apiFetch('/api/users');
+            const data = await resp.json();
+            const user = (data.users || []).find(u => u.id === userId);
+            if (user) {
+                openEditUserModal({
+                    id: user.id,
+                    username: user.username,
+                    display: user.display_name,
+                    role: user.role,
+                });
+            } else {
+                alert('用户不存在');
+            }
+        } catch (err) {
+            console.error('Failed to load user:', err);
+            alert('加载用户信息失败');
+        }
+    }
+
     async function handleUserFormSubmit(e) {
         e.preventDefault();
         const editId = document.getElementById('editUserId').value;
@@ -1887,11 +2302,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 await apiFetch('/api/users', { method: 'POST', body: JSON.stringify(payload) });
             }
             document.getElementById('userModal').style.display = 'none';
-            // Refresh user list view
-            const resp = await apiFetch('/api/users');
-            const data = await resp.json();
-            const users = (data.users || []).map(u => { u.pop?.('password_hash'); u.pop?.('password_salt'); return u; });
-            renderUserList(data.users || []);
+            // Refresh user list via A2UI
+            sendMessage('查询所有用户');
         } catch (err) {
             console.error('Failed to save user:', err);
             alert('保存用户失败');
@@ -1899,17 +2311,71 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function deleteUser(userId) {
-        if (!confirm('确定要删除此用户吗？')) return;
         try {
             await apiFetch(`/api/users/${userId}`, { method: 'DELETE' });
-            // Refresh user list
-            const resp = await apiFetch('/api/users');
-            const data = await resp.json();
-            renderUserList(data.users || []);
         } catch (err) {
             console.error('Failed to delete user:', err);
             alert('删除用户失败');
+            throw err;
         }
+    }
+
+    async function resetUserPassword(userId, username) {
+        if (!confirm(`确定要重置用户「${username}」的密码吗？`)) return;
+        try {
+            const resp = await apiFetch(`/api/users/${userId}/reset-password`, { method: 'POST' });
+            const data = await resp.json();
+            if (data.new_password) {
+                // Show password in a modal
+                showResetPasswordResult(username, data.new_password);
+            }
+        } catch (err) {
+            console.error('Failed to reset password:', err);
+            alert('重置密码失败');
+        }
+    }
+
+    function showResetPasswordResult(username, password) {
+        let modal = document.getElementById('resetPasswordModal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'resetPasswordModal';
+            modal.className = 'modal-overlay';
+            modal.innerHTML = `
+                <div class="modal-card" style="max-width:400px;">
+                    <div class="modal-header">
+                        <h3>密码重置成功</h3>
+                        <button class="icon-btn" id="closeResetModal"><svg width="18" height="18" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="20"><line x1="64" y1="64" x2="192" y2="192"/><line x1="192" y1="64" x2="64" y2="192"/></svg></button>
+                    </div>
+                    <div style="padding:16px 24px;">
+                        <p style="margin-bottom:12px;">已重置用户 <strong id="resetUsername"></strong> 的密码：</p>
+                        <div style="background:var(--bg-color);padding:12px;border-radius:8px;font-family:monospace;font-size:1.1rem;text-align:center;user-select:all;" id="resetPassword"></div>
+                        <p style="margin-top:12px;font-size:0.85rem;color:var(--text-secondary);">请将此密码告知用户，用户登录后需修改密码。</p>
+                    </div>
+                    <div class="modal-actions">
+                        <button class="btn btn-primary" id="copyResetPassword">复制密码</button>
+                        <button class="btn btn-secondary" id="closeResetModalBtn">关闭</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        }
+
+        document.getElementById('resetUsername').textContent = username;
+        document.getElementById('resetPassword').textContent = password;
+        modal.style.display = 'flex';
+
+        // Bind events
+        document.getElementById('closeResetModal').onclick = () => modal.style.display = 'none';
+        document.getElementById('closeResetModalBtn').onclick = () => modal.style.display = 'none';
+        document.getElementById('copyResetPassword').onclick = () => {
+            navigator.clipboard.writeText(password).then(() => {
+                document.getElementById('copyResetPassword').textContent = '已复制';
+                setTimeout(() => {
+                    document.getElementById('copyResetPassword').textContent = '复制密码';
+                }, 2000);
+            });
+        };
     }
 
     // ── Rule Edit View (right panel) ─────────────────────────────────────────

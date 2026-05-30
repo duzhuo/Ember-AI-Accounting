@@ -76,6 +76,7 @@ async function checkAuth() {
             document.getElementById('nav-user-home').textContent = data.user.display_name || data.user.username;
             showScreen('screen-home');
             loadRecentVouchers();
+            startNotificationPolling();
         } else {
             handleLogout();
         }
@@ -85,6 +86,7 @@ async function checkAuth() {
 }
 
 function handleLogout() {
+    stopNotificationPolling();
     authToken = null;
     currentUser = null;
     localStorage.removeItem('ember_token');
@@ -114,6 +116,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {
         document.getElementById('nav-user-home').textContent = data.user.display_name || data.user.username;
         showScreen('screen-home');
         loadRecentVouchers();
+        startNotificationPolling();
     } catch {
         errEl.textContent = '网络错误，请重试';
     } finally {
@@ -424,7 +427,12 @@ async function openVoucherDetail(voucherId) {
 }
 
 function renderVoucherDetail(v) {
-    const statusMap = { draft: ['badge-draft','草稿'], posted: ['badge-posted','已过账'], reversed: ['badge-reversed','已冲销'] };
+    const statusMap = {
+        draft: ['badge-draft','草稿'],
+        pending_approval: ['badge-pending','待审批'],
+        posted: ['badge-posted','已过账'],
+        reversed: ['badge-reversed','已冲销'],
+    };
     const [cls, label] = statusMap[v.status] || ['badge-draft', v.status];
 
     // Header
@@ -478,8 +486,9 @@ function renderVoucherDetail(v) {
     // Action bar
     const confirmBtn = document.getElementById('btn-confirm');
     const alreadyDone = v.status === 'posted' || v.status === 'reversed';
-    confirmBtn.disabled = alreadyDone;
-    confirmBtn.style.display = alreadyDone ? 'none' : 'flex';
+    const isPendingApproval = v.status === 'pending_approval';
+    confirmBtn.disabled = alreadyDone || isPendingApproval;
+    confirmBtn.style.display = (alreadyDone || isPendingApproval) ? 'none' : 'flex';
     document.getElementById('btn-confirmed-label').style.display = alreadyDone ? 'flex' : 'none';
 }
 
@@ -540,6 +549,7 @@ async function loadVoucherList() {
 
         const statusMap = {
             draft:    ['badge-draft','草稿','📄','blue'],
+            pending_approval: ['badge-pending','待审批','⏳','amber'],
             posted:   ['badge-posted','已过账','✅','green'],
             reversed: ['badge-reversed','已冲销','↩️','amber'],
         };
@@ -559,6 +569,205 @@ async function loadVoucherList() {
     } catch {
         listEl.innerHTML = '<p style="text-align:center;padding:2rem;color:var(--accent-danger);font-size:0.85rem">加载失败，请重试</p>';
     }
+}
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+let _notifPollTimer = null;
+let _notifFilter = 'all';
+let _approvalVoucherId = null;
+
+function startNotificationPolling() {
+    stopNotificationPolling();
+    updateNotifBadge();
+    _notifPollTimer = setInterval(updateNotifBadge, 30000);
+}
+
+function stopNotificationPolling() {
+    if (_notifPollTimer) { clearInterval(_notifPollTimer); _notifPollTimer = null; }
+}
+
+async function updateNotifBadge() {
+    try {
+        const resp = await api('/api/notifications/unread-count');
+        const data = await resp.json();
+        const count = data.count || 0;
+        const badge = document.getElementById('mobileNotifBadge');
+        if (count > 0) {
+            badge.textContent = count > 99 ? '99+' : count;
+            badge.style.display = 'flex';
+        } else {
+            badge.style.display = 'none';
+        }
+    } catch {}
+}
+
+document.getElementById('action-notifications').addEventListener('click', () => {
+    showScreen('screen-notifications');
+    loadMobileNotifications();
+});
+
+document.getElementById('notif-nav-back').addEventListener('click', () => showScreen('screen-home'));
+document.getElementById('notif-mark-all').addEventListener('click', async () => {
+    try {
+        await api('/api/notifications/read-all', { method: 'POST' });
+        await loadMobileNotifications();
+        await updateNotifBadge();
+    } catch {}
+});
+
+// Notification filter tabs
+document.querySelector('#screen-notifications .filter-tabs').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.filter-tab');
+    if (!btn) return;
+    document.querySelectorAll('#screen-notifications .filter-tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    _notifFilter = btn.dataset.filter;
+    await loadMobileNotifications();
+});
+
+async function loadMobileNotifications() {
+    const listEl = document.getElementById('notif-list');
+    const emptyEl = document.getElementById('notif-empty');
+    try {
+        const url = `/api/notifications?limit=50${_notifFilter === 'unread' ? '&unread_only=true' : ''}`;
+        const resp = await api(url);
+        const data = await resp.json();
+        const items = data.notifications || [];
+        if (items.length === 0) {
+            listEl.innerHTML = '';
+            emptyEl.style.display = 'flex';
+            return;
+        }
+        emptyEl.style.display = 'none';
+        listEl.innerHTML = items.map(n => {
+            const icon = getNotifIcon(n.type);
+            const time = n.created_at ? new Date(n.created_at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+            return `
+            <div class="notif-item${n.is_read ? '' : ' unread'}" data-id="${n.id}" data-type="${n.type}" data-target="${n.target_id || ''}">
+                <div class="notif-icon type-${n.type}">${icon}</div>
+                <div class="notif-body">
+                    <div class="notif-title">${escHtml(n.title)}</div>
+                    <div class="notif-text">${escHtml(n.body)}</div>
+                    <div class="notif-time">${time}</div>
+                </div>
+            </div>`;
+        }).join('');
+
+        // Click handlers
+        listEl.querySelectorAll('.notif-item').forEach(item => {
+            item.addEventListener('click', async () => {
+                const id = item.dataset.id;
+                const type = item.dataset.type;
+                const target = item.dataset.target;
+                // Mark as read
+                if (item.classList.contains('unread')) {
+                    try { await api(`/api/notifications/${id}/read`, { method: 'POST' }); } catch {}
+                    await updateNotifBadge();
+                }
+                // Navigate
+                if (type === 'approval_request' && target) {
+                    openApprovalScreen(target);
+                } else if (target) {
+                    openVoucherDetail(target);
+                }
+            });
+        });
+    } catch {
+        listEl.innerHTML = '';
+        emptyEl.style.display = 'flex';
+    }
+}
+
+function getNotifIcon(type) {
+    switch (type) {
+        case 'approval_request': return '⏳';
+        case 'approval_approved': return '✅';
+        case 'approval_rejected': return '✗';
+        default: return '🔔';
+    }
+}
+
+// ── Approval Screen ──────────────────────────────────────────────────────────
+
+document.getElementById('approval-nav-back').addEventListener('click', () => showScreen('screen-notifications'));
+
+async function openApprovalScreen(voucherId) {
+    _approvalVoucherId = voucherId;
+    document.getElementById('approval-comment').value = '';
+    const summaryEl = document.getElementById('approval-summary');
+    summaryEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-secondary);">加载中...</div>';
+    showScreen('screen-approval');
+
+    try {
+        const resp = await api(`/api/vouchers/${voucherId}`);
+        const v = await resp.json();
+        const voucherData = v.voucher || v;
+        const data = voucherData.voucher_data ? (typeof voucherData.voucher_data === 'string' ? JSON.parse(voucherData.voucher_data) : voucherData.voucher_data) : {};
+        const totalDebit = (data.lines || []).reduce((s, l) => s + (parseFloat(l.debit_amount) || 0), 0);
+        summaryEl.innerHTML = `
+            <div class="approval-summary">
+                <div class="kv-row"><span class="kv-label">凭证号</span><span class="kv-value">${escHtml(voucherData.voucher_id)}</span></div>
+                <div class="kv-row"><span class="kv-label">摘要</span><span class="kv-value">${escHtml(voucherData.header_text || '-')}</span></div>
+                <div class="kv-row"><span class="kv-label">金额</span><span class="kv-value">¥${totalDebit.toLocaleString('zh-CN', {minimumFractionDigits: 2})}</span></div>
+                <div class="kv-row"><span class="kv-label">公司代码</span><span class="kv-value">${escHtml(voucherData.company_code || '-')}</span></div>
+                <div class="kv-row"><span class="kv-label">凭证日期</span><span class="kv-value">${escHtml(voucherData.document_date || '-')}</span></div>
+            </div>
+        `;
+    } catch {
+        summaryEl.innerHTML = '<div style="padding:16px;text-align:center;color:#dc2626;">加载凭证失败</div>';
+    }
+}
+
+document.getElementById('btn-approve').addEventListener('click', async () => {
+    if (!_approvalVoucherId) return;
+    const btn = document.getElementById('btn-approve');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+    try {
+        await api(`/api/vouchers/${_approvalVoucherId}/approve`, {
+            method: 'POST',
+            body: JSON.stringify({ comment: document.getElementById('approval-comment').value }),
+        });
+        showToast('审批通过', 'success');
+        showScreen('screen-notifications');
+        await loadMobileNotifications();
+        await updateNotifBadge();
+    } catch (e) {
+        showToast(e.message || '审批失败', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '✓ 通过';
+    }
+});
+
+document.getElementById('btn-reject').addEventListener('click', async () => {
+    if (!_approvalVoucherId) return;
+    const comment = document.getElementById('approval-comment').value.trim();
+    if (!comment) { showToast('驳回时必须填写原因', 'error'); return; }
+    const btn = document.getElementById('btn-reject');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+    try {
+        await api(`/api/vouchers/${_approvalVoucherId}/reject`, {
+            method: 'POST',
+            body: JSON.stringify({ comment }),
+        });
+        showToast('已驳回', 'success');
+        showScreen('screen-notifications');
+        await loadMobileNotifications();
+        await updateNotifBadge();
+    } catch (e) {
+        showToast(e.message || '驳回失败', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '✗ 驳回';
+    }
+});
+
+function escHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

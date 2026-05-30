@@ -21,7 +21,7 @@ from agents.ocr_agent import OcrAgent
 
 from database import init_db, migrate_rules_from_excel, seed_default_rules, clean_expired_sessions
 
-from routes import auth, chat, upload, vouchers, rules, audit, attachments, confirm, a2ui_action, export, approval
+from routes import auth, chat, upload, vouchers, rules, audit, attachments, confirm, a2ui_action, export, approval, notifications
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent
 
-app = FastAPI(title="Ember AI Accounting", version="2.0")
+app = FastAPI(title="Ember AI Accounting", version="2.1")
 
 _cors_origins = os.environ.get("CORS_ORIGINS", "http://localhost:8000")
 _origins_list = [o.strip() for o in _cors_origins.split(",") if o.strip()]
@@ -67,6 +67,7 @@ app.include_router(confirm.router)
 app.include_router(a2ui_action.router)
 app.include_router(export.router)
 app.include_router(approval.router)
+app.include_router(notifications.router)
 
 # ── Startup / Shutdown ──────────────────────────────────────────────────────
 
@@ -107,7 +108,7 @@ async def shutdown():
 
 @app.get("/api/health")
 async def health_check():
-    return JSONResponse({"status": "ok", "version": "2.0"})
+    return JSONResponse({"status": "ok", "version": "2.1"})
 
 
 # ── Serve static frontend ────────────────────────────────────────────────────

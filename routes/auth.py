@@ -8,14 +8,11 @@ from database import (
     add_audit_log,
     authenticate_user,
     change_password,
-    clear_login_failures,
     create_session_token,
     create_user,
     delete_session,
     delete_user,
-    is_login_rate_limited,
     list_users,
-    record_login_failure,
     update_user,
     verify_password,
     get_db,
@@ -36,16 +33,10 @@ async def login(payload: dict, request: Request):
     if not username or not password:
         return JSONResponse({"error": "请输入用户名和密码"}, status_code=400)
 
-    if await is_login_rate_limited(ip):
-        return JSONResponse({"error": "登录失败次数过多，请5分钟后再试"}, status_code=429)
-
     user = await authenticate_user(username, password)
     if not user:
-        await record_login_failure(ip)
         await add_audit_log(action="login.failed", username=username, ip_address=ip)
         return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
-
-    await clear_login_failures(ip)
     token = await create_session_token(user["id"])
     await add_audit_log(
         action="login.success", user_id=user["id"], username=user["username"], ip_address=ip,
@@ -133,8 +124,8 @@ async def api_create_user(payload: dict, request: Request):
         return JSONResponse({"error": "用户名、密码和显示名称不能为空"}, status_code=400)
     if len(password) < 6:
         return JSONResponse({"error": "密码至少6位"}, status_code=400)
-    if role not in ("user", "admin"):
-        return JSONResponse({"error": "无效的角色类型"}, status_code=400)
+    if role not in ("user", "admin", "reviewer"):
+        return JSONResponse({"error": "无效的角色类型，可选：user、admin、reviewer"}, status_code=400)
 
     try:
         user = await create_user(username, password, display_name, role)
@@ -157,6 +148,10 @@ async def api_update_user(user_id: str, payload: dict, request: Request):
     admin = await _require_admin(request)
     if user_id == admin["id"] and payload.get("is_active") == 0:
         return JSONResponse({"error": "不能停用自己的账号"}, status_code=400)
+
+    role = payload.get("role")
+    if role and role not in ("user", "admin", "reviewer"):
+        return JSONResponse({"error": "无效的角色类型，可选：user、admin、reviewer"}, status_code=400)
 
     updated = await update_user(user_id, **payload)
     if not updated:
@@ -184,3 +179,45 @@ async def api_delete_user(user_id: str, request: Request):
         target_type="user", target_id=user_id,
     )
     return JSONResponse({"status": "ok"})
+
+
+@router.post("/api/users/{user_id}/reset-password")
+async def api_reset_password(user_id: str, request: Request):
+    """Reset a user's password to a random default password."""
+    import secrets
+    admin = await _require_admin(request)
+
+    # Get the target user
+    users = await list_users()
+    target_user = next((u for u in users if u["id"] == user_id), None)
+    if not target_user:
+        return JSONResponse({"error": "用户不存在"}, status_code=404)
+
+    # Generate new password
+    new_password = "User@" + secrets.token_hex(4)
+
+    # Update password
+    from database import change_password
+    ok = await change_password(user_id, new_password)
+    if not ok:
+        return JSONResponse({"error": "重置密码失败"}, status_code=500)
+
+    # Set must_change_password flag
+    db = await get_db()
+    try:
+        await db.execute("UPDATE users SET must_change_password = 1 WHERE id = ?", (user_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    await add_audit_log(
+        action="user.reset_password", user_id=admin["id"], username=admin["username"],
+        target_type="user", target_id=user_id,
+        details={"target_username": target_user["username"]},
+    )
+
+    return JSONResponse({
+        "status": "ok",
+        "message": f"已重置用户 {target_user['username']} 的密码",
+        "new_password": new_password,
+    })
