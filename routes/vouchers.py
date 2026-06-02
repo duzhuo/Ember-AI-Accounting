@@ -13,7 +13,6 @@ from database import (
     create_reversal_voucher,
     get_voucher_record,
     list_voucher_records,
-    mark_voucher_reversed,
     update_voucher_record,
 )
 
@@ -116,9 +115,6 @@ async def api_reverse_voucher(voucher_id: str, payload: dict, request: Request):
     new_voucher_id = await create_reversal_voucher(voucher_id, user["id"], reason)
     if not new_voucher_id:
         return JSONResponse({"error": "冲销失败"}, status_code=500)
-
-    # Mark original as reversed
-    await mark_voucher_reversed(voucher_id, user["id"], reason)
 
     await add_audit_log(
         action="voucher.reverse", user_id=user["id"], username=user["username"],

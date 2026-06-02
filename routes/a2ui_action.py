@@ -207,7 +207,7 @@ async def handle_a2ui_action(request: Request):
             action="voucher.edit", user_id=user["id"], username=user["username"],
             target_type="voucher", target_id=voucher_id,
         )
-        voucher_front = json.loads(record.get("voucher_data") or "{}")
+        voucher_front = dict(voucher_data)
         voucher_front["status"] = record.get("status", "draft")
         attachments = await list_attachments(voucher_id)
         return JSONResponse({

@@ -1,55 +1,36 @@
 # Ember AI Accounting
 
-AI 原生智能会计凭证系统。通过自然语言对话、发票识别、Excel 上传自动生成会计凭证。
+AI 原生智能会计凭证系统。自然语言对话、发票识别、Excel 上传自动生成会计凭证。
 
 # 常用命令
 
-- 启动服务: `python server.py` (端口 8000)
+- 启动服务: `.venv/bin/python server.py` (端口 8000)
 - 安装依赖: `pip install -r requirements.txt`
-- 数据库位置: `data/ember.db` (SQLite)
-- 查看日志: `tail -f data/logs/ember.log`
+- 运行测试: `.venv/bin/python -m pytest tests/ -v`
+- 数据库: `data/ember.db` (SQLite)
+- 日志: `tail -f data/logs/ember.log`
 
 # 代码规范
 
 ## Python
-- 使用 4 空格缩进
-- 函数和变量使用 snake_case
-- 类名使用 PascalCase
-- 异步函数使用 async/await
-- 类型提示使用 `str | None` 而非 `Optional[str]`
+- 4 空格缩进，snake_case 函数/变量，PascalCase 类名
+- 异步用 async/await，类型提示用 `str | None` 而非 `Optional[str]`
+- FastAPI 路由每个文件一个 APIRouter，放在 `routes/`
 
 ## JavaScript
-- 使用 4 空格缩进
-- 函数使用 camelCase
-- 常量使用 UPPER_SNAKE_CASE
-- DOM 操作使用原生 API（无框架）
+- 4 空格缩进，camelCase 函数，UPPER_SNAKE_CASE 常量
+- 原生 DOM 操作，无框架
+- A2UI 协议: 服务端返回组件声明，前端动态渲染
 
 ## CSS
-- 使用 CSS 变量（定义在 `:root`）
-- 类名使用 kebab-case
-- 响应式使用 `@media`
+- CSS 变量定义在 `:root`，kebab-case 类名，`@media` 响应式
 
-# 项目架构
+# 架构要点
 
-## 后端 (Python/FastAPI)
-- `server.py` — FastAPI 入口，路由注册
-- `database.py` — SQLite 操作（用户、凭证、规则、通知、审计）
-- `routes/` — API 路由（每个文件一个 APIRouter）
-- `agents/` — AgentScope Agent（意图识别、凭证生成、OCR）
-- `helpers/` — 工具函数（认证、SSE、A2UI、导出）
-
-## 前端
-- `index.html` + `script.js` — 桌面端（双栏布局：侧边栏 + 工作区）
-- `mobile.html` + `mobile.js` — 移动端（单页应用）
-- A2UI 协议 — 服务端返回组件声明，前端动态渲染
-
-## 数据库表
-- `users` — 用户（角色：admin/reviewer/user）
-- `voucher_records` — 凭证（状态：draft/pending_approval/posted/reversed）
-- `approval_records` — 审批记录
-- `notifications` — 通知
-- `chat_messages` — 聊天记录
-- `audit_logs` — 审计日志
+- 后端: FastAPI + SQLite + AgentScope Agent
+- 前端: `index.html` + `script.js` (桌面) / `mobile.html` + `mobile.js` (移动)
+- 前端模块: `static/js/` 下按功能拆分 (common, api, auth, state, event-bus, views, chat, a2ui, components)
+- 数据库表: users, voucher_records, approval_records, notifications, chat_messages, audit_logs
 
 # 角色权限
 
@@ -61,26 +42,15 @@ AI 原生智能会计凭证系统。通过自然语言对话、发票识别、Ex
 
 # 已知陷阱
 
-## 密码更新 bug
-`update_user` 函数中，密码更新逻辑在字段过滤之后。如果只更新密码不更新其他字段，需要确保密码处理在空字段检查之前。
-
-## A2UI vs 传统渲染
-用户列表使用 A2UI 渲染时，DataTable 不支持行内按钮。需要使用 `actionColumns` 配置或切换到传统渲染。
-
-## Phosphor Icons 已移除
-前端不再使用 Phosphor Icons CDN，所有图标使用内联 SVG。
-
-## 会话标题生成
-会话标题由 LLM 异步生成，首次查询时可能为空。
+- `update_user` 密码更新: 密码处理必须在空字段检查之前，否则只更新密码会失败
+- A2UI DataTable 不支持行内按钮，需用 `actionColumns` 或传统渲染
+- 前端图标全部内联 SVG，不用 CDN
+- 会话标题由 LLM 异步生成，首次查询可能为空
 
 # Git 工作流
 
 - 主分支: `master`
-- 提交信息格式: `类型: 简短描述`
-  - feat: 新功能
-  - fix: 修复
-  - refactor: 重构
-  - docs: 文档
+- 提交格式: `类型: 简短描述` (feat/fix/refactor/docs)
 - **推送前必须更新 README.md**
 
 # 环境变量
@@ -93,20 +63,8 @@ PMDE_VISION_MODEL_NAME=your-vision-model
 CORS_ORIGINS=http://localhost:8000
 ```
 
-# 默认账号
+# 测试
 
-- 管理员: `admin` / `admin123`（首次登录需修改密码）
-- 密码格式: bcrypt 哈希存储
-
-# API 端点
-
-- `POST /api/auth/login` — 登录
-- `POST /api/chat` — 聊天（SSE 流式）
-- `POST /api/upload` — 文件上传（SSE 流式）
-- `GET/PUT /api/vouchers` — 凭证 CRUD
-- `POST /api/vouchers/{id}/submit` — 提交审批
-- `POST /api/vouchers/{id}/approve` — 审批通过
-- `POST /api/vouchers/{id}/reject` — 审批驳回
-- `GET /api/notifications` — 通知列表
-- `GET /api/rules` — 凭证规则
-- `GET /api/users` — 用户列表（管理员）
+- E2E 测试: `npx playwright test` (Playwright, 需要服务运行)
+- Agent 评测: `.venv/bin/python -m pytest tests/evals/ -v`
+- 写测试后必须运行验证，修复失败的测试

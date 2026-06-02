@@ -234,69 +234,75 @@ async def get_db() -> aiosqlite.Connection:
     return db
 
 
+async def _run_migrations(db: aiosqlite.Connection) -> None:
+    """Run schema migrations for incremental upgrades."""
+    # Migration: add must_change_password column if missing
+    cursor = await db.execute("PRAGMA table_info(users)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "must_change_password" not in columns:
+        await db.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        await db.execute("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
+        await db.commit()
+        logger.info("Migration: added must_change_password column to users")
+
+    # Migration: add reversal columns to voucher_records if missing
+    cursor = await db.execute("PRAGMA table_info(voucher_records)")
+    vr_columns = {row[1] for row in await cursor.fetchall()}
+    if "reversed_at" not in vr_columns:
+        await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_at TEXT")
+        await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_by TEXT")
+        await db.execute("ALTER TABLE voucher_records ADD COLUMN reversal_reason TEXT")
+        await db.commit()
+        logger.info("Migration: added reversal columns to voucher_records")
+
+    # Migration: create notifications table if missing
+    cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='notifications'")
+    if not await cursor.fetchone():
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+            CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, is_read);
+        """)
+        await db.commit()
+        logger.info("Migration: created notifications table")
+
+
+async def _ensure_default_admin(db: aiosqlite.Connection) -> None:
+    """Create default admin user if no users exist."""
+    cursor = await db.execute("SELECT COUNT(*) FROM users")
+    row = await cursor.fetchone()
+    if row[0] == 0:
+        admin_id = str(uuid.uuid4())
+        hashed, salt = _hash_password("admin123")
+        await db.execute(
+            """INSERT INTO users (id, username, password_hash, password_salt, display_name, role, must_change_password, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (admin_id, "admin", hashed, salt, "系统管理员", "admin", 1,
+             datetime.now().isoformat()),
+        )
+        await db.commit()
+        logger.info("Created default admin user (username=admin, password=admin123)")
+
+
 async def init_db() -> None:
     """Initialize the database schema and create default admin user."""
     db = await get_db()
     try:
         await db.executescript(SCHEMA)
         await db.commit()
-
-        # Migration: add must_change_password column if missing
-        cursor = await db.execute("PRAGMA table_info(users)")
-        columns = {row[1] for row in await cursor.fetchall()}
-        if "must_change_password" not in columns:
-            await db.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
-            # Flag existing admin users to change password
-            await db.execute("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
-            await db.commit()
-            logger.info("Migration: added must_change_password column to users")
-
-        # Migration: add reversal columns to voucher_records if missing
-        cursor = await db.execute("PRAGMA table_info(voucher_records)")
-        vr_columns = {row[1] for row in await cursor.fetchall()}
-        if "reversed_at" not in vr_columns:
-            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_at TEXT")
-            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversed_by TEXT")
-            await db.execute("ALTER TABLE voucher_records ADD COLUMN reversal_reason TEXT")
-            await db.commit()
-            logger.info("Migration: added reversal columns to voucher_records")
-
-        # Migration: create notifications table if missing
-        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='notifications'")
-        if not await cursor.fetchone():
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS notifications (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    body TEXT NOT NULL,
-                    target_type TEXT,
-                    target_id TEXT,
-                    is_read INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
-                CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, is_read);
-            """)
-            await db.commit()
-            logger.info("Migration: created notifications table")
-
-        # Create default admin user if no users exist
-        cursor = await db.execute("SELECT COUNT(*) FROM users")
-        row = await cursor.fetchone()
-        if row[0] == 0:
-            admin_id = str(uuid.uuid4())
-            hashed, salt = _hash_password("admin123")
-            await db.execute(
-                """INSERT INTO users (id, username, password_hash, password_salt, display_name, role, must_change_password, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (admin_id, "admin", hashed, salt, "系统管理员", "admin", 1,
-                 datetime.now().isoformat()),
-            )
-            await db.commit()
-            logger.info("Created default admin user (username=admin, password=admin123)")
+        await _run_migrations(db)
+        await _ensure_default_admin(db)
     finally:
         await db.close()
 
@@ -505,6 +511,54 @@ async def delete_user(user_id: str) -> bool:
 # ── Voucher record operations ─────────────────────────────────────────────────
 
 
+def _build_voucher_filter_conditions(
+    user_id: str | None = None,
+    status: str | None = None,
+    keyword: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    table_alias: str = "",
+) -> tuple[list[str], list[Any]]:
+    """Build WHERE conditions and params for voucher record queries.
+
+    Args:
+        table_alias: Optional table alias prefix (e.g. "vr." for JOINs).
+
+    Returns:
+        (conditions, params) tuple.
+    """
+    prefix = f"{table_alias}." if table_alias else ""
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if user_id:
+        conditions.append(f"{prefix}user_id = ?")
+        params.append(user_id)
+    if status:
+        conditions.append(f"{prefix}status = ?")
+        params.append(status)
+    if keyword:
+        like = f"%{keyword}%"
+        conditions.append(f"({prefix}header_text LIKE ? OR {prefix}reference LIKE ?)")
+        params.extend([like, like])
+    if date_from:
+        conditions.append(f"{prefix}document_date >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append(f"{prefix}document_date <= ?")
+        params.append(date_to)
+    if amount_min is not None:
+        conditions.append(f"CAST(json_extract({prefix}voucher_data, '$.total_amount') AS REAL) >= ?")
+        params.append(amount_min)
+    if amount_max is not None:
+        conditions.append(f"CAST(json_extract({prefix}voucher_data, '$.total_amount') AS REAL) <= ?")
+        params.append(amount_max)
+
+    return conditions, params
+
+
 async def save_voucher_record(
     voucher_id: str,
     user_id: str,
@@ -518,7 +572,7 @@ async def save_voucher_record(
     header_text: str = "",
     confidence: str = "",
     warnings: list | None = None,
-) -> str:
+) -> tuple[str, str]:
     """Save a voucher record to the database. Returns (record_id, voucher_id) tuple."""
     db = await get_db()
     try:
@@ -736,37 +790,17 @@ async def list_voucher_records(
     offset: int = 0,
 ) -> list[dict]:
     """List voucher records with optional filters."""
+    conditions, params = _build_voucher_filter_conditions(
+        user_id=user_id, status=status, keyword=keyword,
+        date_from=date_from, date_to=date_to,
+        amount_min=amount_min, amount_max=amount_max,
+        table_alias="vr",
+    )
+    where = " AND ".join(conditions) if conditions else "1=1"
+    params.extend([limit, offset])
+
     db = await get_db()
     try:
-        conditions = []
-        params: list[Any] = []
-
-        if user_id:
-            conditions.append("vr.user_id = ?")
-            params.append(user_id)
-        if status:
-            conditions.append("vr.status = ?")
-            params.append(status)
-        if keyword:
-            like = f"%{keyword}%"
-            conditions.append("(vr.header_text LIKE ? OR vr.reference LIKE ?)")
-            params.extend([like, like])
-        if date_from:
-            conditions.append("vr.document_date >= ?")
-            params.append(date_from)
-        if date_to:
-            conditions.append("vr.document_date <= ?")
-            params.append(date_to)
-        if amount_min is not None:
-            conditions.append("CAST(json_extract(vr.voucher_data, '$.total_amount') AS REAL) >= ?")
-            params.append(amount_min)
-        if amount_max is not None:
-            conditions.append("CAST(json_extract(vr.voucher_data, '$.total_amount') AS REAL) <= ?")
-            params.append(amount_max)
-
-        where = " AND ".join(conditions) if conditions else "1=1"
-        params.extend([limit, offset])
-
         cursor = await db.execute(
             f"""SELECT vr.*, u.display_name as user_display_name
                 FROM voucher_records vr
@@ -822,33 +856,15 @@ async def count_voucher_records(
     amount_max: float | None = None,
 ) -> int:
     """Count voucher records with optional filters."""
+    conditions, params = _build_voucher_filter_conditions(
+        user_id=user_id, status=status, keyword=keyword,
+        date_from=date_from, date_to=date_to,
+        amount_min=amount_min, amount_max=amount_max,
+    )
+    where = " AND ".join(conditions) if conditions else "1=1"
+
     db = await get_db()
     try:
-        conditions = []
-        params: list[Any] = []
-        if user_id:
-            conditions.append("user_id = ?")
-            params.append(user_id)
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if keyword:
-            like = f"%{keyword}%"
-            conditions.append("(header_text LIKE ? OR reference LIKE ?)")
-            params.extend([like, like])
-        if date_from:
-            conditions.append("document_date >= ?")
-            params.append(date_from)
-        if date_to:
-            conditions.append("document_date <= ?")
-            params.append(date_to)
-        if amount_min is not None:
-            conditions.append("CAST(json_extract(voucher_data, '$.total_amount') AS REAL) >= ?")
-            params.append(amount_min)
-        if amount_max is not None:
-            conditions.append("CAST(json_extract(voucher_data, '$.total_amount') AS REAL) <= ?")
-            params.append(amount_max)
-        where = " AND ".join(conditions) if conditions else "1=1"
         cursor = await db.execute(f"SELECT COUNT(*) FROM voucher_records WHERE {where}", params)
         row = await cursor.fetchone()
         return row[0]

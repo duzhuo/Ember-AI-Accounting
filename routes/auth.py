@@ -1,7 +1,11 @@
 """Auth and user management routes."""
 
+import logging
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 from helpers.auth import _get_current_user, _require_auth, _require_admin
 from database import (
@@ -197,7 +201,6 @@ async def api_reset_password(user_id: str, request: Request):
     new_password = "User@" + secrets.token_hex(4)
 
     # Update password
-    from database import change_password
     ok = await change_password(user_id, new_password)
     if not ok:
         return JSONResponse({"error": "重置密码失败"}, status_code=500)

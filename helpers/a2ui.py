@@ -11,7 +11,7 @@ BIZ_TYPE_LABELS = {
 }
 
 
-# ── A2UI Protocol Helpers ────────────────────────────────────────────────────
+# ── Reusable A2UI component builders ─────────────────────────────────────────
 
 
 def _build_a2ui_messages(surface_id: str, components: list, data: dict | None = None) -> list:
@@ -23,7 +23,103 @@ def _build_a2ui_messages(surface_id: str, components: list, data: dict | None = 
     return msgs
 
 
-def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = True, attachments: list | None = None) -> dict:
+def _a2ui_datatable(
+    table_id: str,
+    columns: list[dict],
+    rows: list[dict],
+    **kwargs: object,
+) -> dict:
+    """Build a DataTable component dict.
+
+    Args:
+        table_id: Component ID.
+        columns: Column definitions.
+        rows: Row data.
+        **kwargs: Extra attributes (selectable, rowAction, footer, actionColumns, etc.).
+    """
+    component: dict = {
+        "id": table_id,
+        "component": "DataTable",
+        "columns": columns,
+        "rows": rows,
+    }
+    component.update(kwargs)
+    return component
+
+
+def _a2ui_button(
+    btn_id: str,
+    text: str,
+    variant: str = "secondary",
+    action: dict | None = None,
+    disabled: bool = False,
+) -> list[dict]:
+    """Build a Button + Text child pair.
+
+    Returns a list of two component dicts: the Button and its Text child.
+    """
+    text_id = f"{btn_id}-text"
+    btn: dict = {
+        "id": btn_id,
+        "component": "Button",
+        "child": text_id,
+        "variant": variant,
+    }
+    if action:
+        btn["action"] = action
+    if disabled:
+        btn["disabled"] = True
+    return [btn, {"id": text_id, "component": "Text", "text": text}]
+
+
+def _a2ui_card(card_id: str, title: str, children: list[str], **kwargs: object) -> dict:
+    """Build a Card component dict."""
+    component: dict = {
+        "id": card_id,
+        "component": "Card",
+        "title": title,
+        "children": children,
+    }
+    component.update(kwargs)
+    return component
+
+
+def _a2ui_pagination(
+    offset: int,
+    limit: int,
+    total: int,
+    event_name: str,
+    extra_data: dict | None = None,
+) -> list[dict]:
+    """Build pagination components (prev-btn, page-info, next-btn wrapped in a Row).
+
+    Returns a list of component dicts, or empty list if pagination is not needed.
+    """
+    if total <= limit:
+        return []
+
+    has_prev = offset > 0
+    has_next = offset + limit < total
+    page_num = offset // limit + 1
+    total_pages = max(1, (total + limit - 1) // limit)
+    pagination_data = extra_data or {}
+
+    return [
+        {"id": "pagination-row", "component": "Row", "children": ["prev-btn", "page-info", "next-btn"]},
+        *_a2ui_button("prev-btn", "上一页", "secondary",
+                       action={"event": {"name": event_name, "data": {**pagination_data, "limit": limit, "offset": max(0, offset - limit)}}},
+                       disabled=not has_prev),
+        {"id": "page-info", "component": "Text", "text": f"第 {page_num}/{total_pages} 页", "variant": "caption"},
+        *_a2ui_button("next-btn", "下一页", "secondary",
+                       action={"event": {"name": event_name, "data": {**pagination_data, "limit": limit, "offset": offset + limit}}},
+                       disabled=not has_next),
+    ]
+
+
+# ── A2UI Protocol Converters ─────────────────────────────────────────────────
+
+
+def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = True, attachments: list | None = None) -> list:
     """Convert voucher frontend dict to A2UI messages."""
     rows = voucher_front.get("rows", [])
     header_pairs = [
@@ -75,24 +171,22 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
     is_posted = status == "posted"
     is_reversed = status == "reversed"
 
-    # Status badge
     status_map = {"posted": "已过账", "reversed": "已冲销"}
     status_badge = status_map.get(status, "草稿")
 
     components = [
-        {"id": "back-btn", "component": "Button", "child": "back-text",
-         "variant": "secondary", "action": {"event": {"name": "back_to_voucher_list"}}},
-        {"id": "back-text", "component": "Text", "text": "← 返回列表"},
+        *_a2ui_button("back-btn", "← 返回列表", "secondary",
+                       action={"event": {"name": "back_to_voucher_list"}}),
         {"id": "title", "component": "Text", "text": f"凭证 {voucher_id}  [{status_badge}]", "variant": "h2"},
-        {"id": "info-card", "component": "Card", "title": "凭证信息", "children": ["kv-info"]},
+        _a2ui_card("info-card", "凭证信息", ["kv-info"]),
         {"id": "kv-info", "component": "KeyValue", "pairs": header_pairs},
         *warning_components,
-        {"id": "rows-card", "component": "Card", "title": "凭证明细", "children": ["rows-table"]},
-        {"id": "rows-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows,
-         "footer": {"label": "合计", "values": ["", "", "", "",
-                      f"{total_debit:,.2f}", f"{total_credit:,.2f}", "", ""]}},
+        _a2ui_card("rows-card", "凭证明细", ["rows-table"]),
+        _a2ui_datatable("rows-table", table_columns, table_rows,
+                         footer={"label": "合计", "values": ["", "", "", "",
+                                 f"{total_debit:,.2f}", f"{total_credit:,.2f}", "", ""]}),
     ]
+
     # Attachments section
     att_list = attachments or []
     att_table_rows = []
@@ -113,49 +207,31 @@ def _voucher_to_a2ui(voucher_front: dict, voucher_id: str, show_actions: bool = 
         {"key": "created_at", "label": "上传时间"},
     ]
 
-    components.append(
-        {"id": "attach-card", "component": "Card", "title": f"附件（{len(att_list)} 份）", "children": ["attach-table", "attach-btn-row"]},
-    )
-    components.append(
-        {"id": "attach-table", "component": "DataTable",
-         "columns": att_columns, "rows": att_table_rows},
-    )
-    components.append(
-        {"id": "attach-btn-row", "component": "Row", "children": ["upload-attach-btn"]},
-    )
-    components.append(
-        {"id": "upload-attach-btn", "component": "Button", "child": "upload-attach-text",
-         "variant": "secondary",
-         "action": {"event": {"name": "upload_attachment", "data": {"voucherId": voucher_id}}}},
-    )
-    components.append(
-        {"id": "upload-attach-text", "component": "Text", "text": "上传附件"},
-    )
+    components.append(_a2ui_card("attach-card", f"附件（{len(att_list)} 份）", ["attach-table", "attach-btn-row"]))
+    components.append(_a2ui_datatable("attach-table", att_columns, att_table_rows))
+    components.append({"id": "attach-btn-row", "component": "Row", "children": ["upload-attach-btn"]})
+    components.extend(_a2ui_button("upload-attach-btn", "上传附件", "secondary",
+                                    action={"event": {"name": "upload_attachment", "data": {"voucherId": voucher_id}}}))
 
     if show_actions:
-        components.extend([
-            {"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn", "reverse-btn", "pdf-btn"]},
-            {"id": "confirm-btn", "component": "Button", "child": "confirm-text",
-             "variant": "primary", "disabled": is_posted or is_reversed,
-             "action": {"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "confirm-text", "component": "Text", "text": "已过账" if is_posted else ("已冲销" if is_reversed else "确认并记账")},
-            {"id": "edit-btn", "component": "Button", "child": "edit-text",
-             "variant": "secondary", "disabled": is_posted or is_reversed,
-             "action": {"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "edit-text", "component": "Text", "text": "编辑凭证"},
-            {"id": "reverse-btn", "component": "Button", "child": "reverse-text",
-             "variant": "danger", "disabled": not is_posted,
-             "action": {"event": {"name": "reverse_voucher", "data": {"voucherId": voucher_id}}}},
-            {"id": "reverse-text", "component": "Text", "text": "冲销凭证"},
-            {"id": "pdf-btn", "component": "Button", "child": "pdf-text",
-             "variant": "secondary",
-             "action": {"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}},
-            {"id": "pdf-text", "component": "Text", "text": "导出 PDF"},
-        ])
+        confirm_text = "已过账" if is_posted else ("已冲销" if is_reversed else "确认并记账")
+        components.append({"id": "actions-row", "component": "Row", "children": ["confirm-btn", "edit-btn", "reverse-btn", "pdf-btn"]})
+        components.extend(_a2ui_button("confirm-btn", confirm_text, "primary",
+                                        action={"event": {"name": "confirm_voucher", "data": {"voucherId": voucher_id}}},
+                                        disabled=is_posted or is_reversed))
+        components.extend(_a2ui_button("edit-btn", "编辑凭证", "secondary",
+                                        action={"event": {"name": "edit_voucher", "data": {"voucherId": voucher_id}}},
+                                        disabled=is_posted or is_reversed))
+        components.extend(_a2ui_button("reverse-btn", "冲销凭证", "danger",
+                                        action={"event": {"name": "reverse_voucher", "data": {"voucherId": voucher_id}}},
+                                        disabled=not is_posted))
+        components.extend(_a2ui_button("pdf-btn", "导出 PDF", "secondary",
+                                        action={"event": {"name": "export_voucher_pdf", "data": {"voucherId": voucher_id}}}))
+
     return _build_a2ui_messages("voucher-detail", components)
 
 
-def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, keyword: str | None = None, limit: int = 50, offset: int = 0) -> list:
     """Convert voucher records list to A2UI messages with pagination."""
     status_label = {"draft": "草稿", "posted": "已过账", "reversed": "已冲销"}.get(status_filter, "全部")
 
@@ -194,45 +270,27 @@ def _voucher_list_to_a2ui(records: list, total: int, status_filter: str | None, 
         {"id": "search-row", "component": "Row", "children": ["search-input", "search-btn", "batch-post-btn"]},
         {"id": "search-input", "component": "SearchInput", "placeholder": "搜索凭证（摘要、凭证号、客户）",
          "value": keyword or "", "action": {"event": {"name": "search_vouchers"}}},
-        {"id": "search-btn", "component": "Button", "child": "search-btn-text",
-         "variant": "secondary", "action": {"event": {"name": "search_vouchers"}}},
-        {"id": "search-btn-text", "component": "Text", "text": "搜索"},
-        {"id": "batch-post-btn", "component": "Button", "child": "batch-post-text",
-         "variant": "primary", "disabled": True,
-         "action": {"event": {"name": "batch_post_vouchers"}}},
-        {"id": "batch-post-text", "component": "Text", "text": "批量过账"},
+        *_a2ui_button("search-btn", "搜索", "secondary",
+                       action={"event": {"name": "search_vouchers"}}),
+        *_a2ui_button("batch-post-btn", "批量过账", "primary",
+                       action={"event": {"name": "batch_post_vouchers"}},
+                       disabled=True),
         {"id": "filter-tabs", "component": "FilterTabs",
          "tabs": tabs, "active": status_filter or "",
          "action": {"event": {"name": "filter_vouchers"}}},
-        {"id": "voucher-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows, "selectable": True,
-         "rowAction": {"event": {"name": "view_voucher_detail", "data": {"voucherId": "{voucher_id}"}}}},
+        _a2ui_datatable("voucher-table", table_columns, table_rows, selectable=True,
+                         rowAction={"event": {"name": "view_voucher_detail", "data": {"voucherId": "{voucher_id}"}}}),
     ]
 
     # Pagination
-    has_prev = offset > 0
-    has_next = offset + limit < total
-    page_num = offset // limit + 1
-    total_pages = max(1, (total + limit - 1) // limit)
-    if total > limit:
-        pagination_data = {"status": status_filter or "", "keyword": keyword or ""}
-        components.append({"id": "pagination-row", "component": "Row", "children": ["prev-btn", "page-info", "next-btn"]})
-        components.append({"id": "prev-btn", "component": "Button", "child": "prev-text",
-                           "variant": "secondary", "disabled": not has_prev,
-                           "action": {"event": {"name": "filter_vouchers" if not keyword else "search_vouchers",
-                                      "data": {**pagination_data, "limit": limit, "offset": max(0, offset - limit)}}}})
-        components.append({"id": "prev-text", "component": "Text", "text": "上一页"})
-        components.append({"id": "page-info", "component": "Text", "text": f"第 {page_num}/{total_pages} 页", "variant": "caption"})
-        components.append({"id": "next-btn", "component": "Button", "child": "next-text",
-                           "variant": "secondary", "disabled": not has_next,
-                           "action": {"event": {"name": "filter_vouchers" if not keyword else "search_vouchers",
-                                      "data": {**pagination_data, "limit": limit, "offset": offset + limit}}}})
-        components.append({"id": "next-text", "component": "Text", "text": "下一页"})
+    pagination_event = "filter_vouchers" if not keyword else "search_vouchers"
+    pagination_data = {"status": status_filter or "", "keyword": keyword or ""}
+    components.extend(_a2ui_pagination(offset, limit, total, pagination_event, pagination_data))
 
     return _build_a2ui_messages("voucher-list", components)
 
 
-def _rules_to_a2ui(rules_list: list, rule_type: str | None, rule_mgmt: dict | None = None) -> dict:
+def _rules_to_a2ui(rules_list: list, rule_type: str | None, rule_mgmt: dict | None = None) -> list:
     """Convert rules list to A2UI messages."""
     biz_label = BIZ_TYPE_LABELS.get(rule_type, rule_type) if rule_type else "全部"
 
@@ -255,33 +313,27 @@ def _rules_to_a2ui(rules_list: list, rule_type: str | None, rule_mgmt: dict | No
             "line_count": str(len(rule.get("lines", []))),
         })
 
-    action_buttons = []
+    action_buttons: list[dict] = []
     if rule_mgmt and rule_mgmt.get("action") == "create":
-        action_buttons.append({
-            "id": "add-rule-btn", "component": "Button", "child": "add-rule-text",
-            "variant": "primary",
-            "action": {"event": {"name": "create_rule", "data": {"ruleType": rule_type}}}},
-        )
-        action_buttons.append({"id": "add-rule-text", "component": "Text", "text": "新增规则"})
+        action_buttons.extend(_a2ui_button("add-rule-btn", "新增规则", "primary",
+                                            action={"event": {"name": "create_rule", "data": {"ruleType": rule_type}}}))
 
     components = [
         {"id": "title", "component": "Text", "text": f"凭证规则 — {biz_label}（共 {len(rules_list)} 条）", "variant": "h2"},
-        {"id": "rules-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows,
-         "rowAction": {"event": {"name": "view_rule_detail", "data": {"ruleCode": "{rule_code}"}}}},
+        _a2ui_datatable("rules-table", table_columns, table_rows,
+                         rowAction={"event": {"name": "view_rule_detail", "data": {"ruleCode": "{rule_code}"}}}),
         *action_buttons,
     ]
     return _build_a2ui_messages("rules", components)
 
 
-def _rule_detail_to_a2ui(rule: dict) -> dict:
+def _rule_detail_to_a2ui(rule: dict) -> list:
     """Convert a single rule with lines to A2UI detail view."""
     biz_label = BIZ_TYPE_LABELS.get(rule.get("business_type"), rule.get("business_type", ""))
     components = [
         {"id": "detail-title", "component": "Text",
          "text": f"规则详情 — {rule.get('rule_code', '')}", "variant": "h2"},
-        {"id": "detail-info", "component": "Card", "children": ["info-biz", "info-prod", "info-tax", "info-doc"],
-         "title": "基本信息"},
+        _a2ui_card("detail-info", "基本信息", ["info-biz", "info-prod", "info-tax", "info-doc"]),
         {"id": "info-biz", "component": "Text", "text": f"业务类型：{biz_label}"},
         {"id": "info-prod", "component": "Text", "text": f"产品类型：{rule.get('product_type', '-')}"},
         {"id": "info-tax", "component": "Text", "text": f"税率：{rule.get('tax_rate', '-')}"},
@@ -309,24 +361,17 @@ def _rule_detail_to_a2ui(rule: dict) -> dict:
                 "amount_field": line.get("amount_field", ""),
                 "tax_code_rule": line.get("tax_code_rule", ""),
             })
-        components.append({
-            "id": "lines-table", "component": "DataTable",
-            "columns": line_columns, "rows": line_rows,
-        })
+        components.append(_a2ui_datatable("lines-table", line_columns, line_rows))
     else:
         components.append({"id": "no-lines", "component": "Text", "text": "暂无分录行"})
 
-    components.append({
-        "id": "back-btn", "component": "Button", "child": "back-btn-text",
-        "variant": "secondary",
-        "action": {"event": {"name": "back_to_rules", "data": {}}},
-    })
-    components.append({"id": "back-btn-text", "component": "Text", "text": "返回规则列表"})
+    components.extend(_a2ui_button("back-btn", "返回规则列表", "secondary",
+                                    action={"event": {"name": "back_to_rules", "data": {}}}))
 
     return _build_a2ui_messages("rule_detail", components)
 
 
-def _users_to_a2ui(users: list) -> dict:
+def _users_to_a2ui(users: list) -> list:
     """Convert users list to A2UI messages."""
     table_columns = [
         {"key": "username", "label": "用户名"},
@@ -347,7 +392,6 @@ def _users_to_a2ui(users: list) -> dict:
             "actions": "",  # Will be rendered by actionColumns
         })
 
-    # Action column definitions
     action_columns = {
         "actions": [
             {
@@ -373,8 +417,6 @@ def _users_to_a2ui(users: list) -> dict:
 
     components = [
         {"id": "title", "component": "Text", "text": f"用户管理（共 {len(users)} 人）", "variant": "h2"},
-        {"id": "users-table", "component": "DataTable",
-         "columns": table_columns, "rows": table_rows,
-         "actionColumns": action_columns},
+        _a2ui_datatable("users-table", table_columns, table_rows, actionColumns=action_columns),
     ]
     return _build_a2ui_messages("users", components)

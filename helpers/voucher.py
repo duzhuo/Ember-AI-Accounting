@@ -7,7 +7,6 @@ from database import (
     create_reversal_voucher,
     get_voucher_record,
     mark_voucher_posted,
-    mark_voucher_reversed,
 )
 
 
@@ -50,7 +49,6 @@ async def reverse_voucher(voucher_id: str, user: dict, reason: str) -> dict:
     if not new_voucher_id:
         return {"status": "error", "message": "冲销失败"}
 
-    await mark_voucher_reversed(voucher_id, user["id"], reason)
     await add_audit_log(
         action="voucher.reverse", user_id=user["id"], username=user["username"],
         target_type="voucher", target_id=voucher_id,

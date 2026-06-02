@@ -1,7 +1,6 @@
 """CSV export routes for SAP voucher data."""
 
 import csv
-import json
 import tempfile
 
 from fastapi import APIRouter, Request
@@ -10,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from database import get_voucher_record
 from helpers.auth import _require_auth
 from helpers.csv_export import POSTED_CSV
-from sap_exporter import SAP_COLUMNS
+from sap_exporter import SAP_COLUMNS, record_to_sap_rows
 
 router = APIRouter()
 
@@ -53,30 +52,7 @@ async def export_vouchers_csv(request: Request):
         if not record:
             continue
         found += 1
-        voucher_data = json.loads(record.get("voucher_data") or "{}")
-        rows = voucher_data.get("rows", [])
-        for row in rows:
-            writer.writerow({
-                "BUKRS": record.get("company_code", ""),
-                "BLART": record.get("document_type", ""),
-                "BLDAT": record.get("document_date", ""),
-                "BUDAT": record.get("posting_date", ""),
-                "XBLNR": record.get("reference", ""),
-                "BKTXT": record.get("header_text", ""),
-                "BUZEI": row.get("line_no", ""),
-                "SHKZG": row.get("debit_credit", ""),
-                "HKONT": row.get("account_code", ""),
-                "ACCOUNT_NAME": row.get("account_name", ""),
-                "WRBTR": row.get("debit", 0) or row.get("credit", 0),
-                "WAERS": row.get("currency", "CNY"),
-                "KUNNR": row.get("customer_code", ""),
-                "CUSTOMER_NAME": row.get("customer_name", ""),
-                "MWSKZ": row.get("tax_code", ""),
-                "PRCTR": row.get("profit_center", ""),
-                "KOSTL": row.get("cost_center", ""),
-                "ZUONR": row.get("assignment", ""),
-                "SGTXT": row.get("text", ""),
-            })
+        writer.writerows(record_to_sap_rows(record))
 
     tmp.close()
 

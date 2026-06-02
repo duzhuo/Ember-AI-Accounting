@@ -11,6 +11,7 @@ from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
 from agentscope.tool import FunctionTool, Toolkit
 
+from helpers.voucher import _voucher_to_front
 from prompts import VOUCHER_GENERATION_PROMPT
 from voucher_models import SalesTransaction, ExpenseTransaction, Voucher, VoucherLine
 from voucher_rules import build_sales_revenue_voucher, build_expense_voucher
@@ -70,7 +71,7 @@ class VoucherAgent(Agent):
             logger.warning("LLM voucher parsing failed, falling back to rule engine.")
             voucher = _build_fallback_voucher(txn)
 
-        voucher_dict = _voucher_to_dict(voucher)
+        voucher_dict = _voucher_to_front(voucher)
         text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
 
         return AssistantMsg(
@@ -79,34 +80,6 @@ class VoucherAgent(Agent):
             content=text,
             metadata={"status": "generated", "voucher": voucher},
         )
-
-    async def stream_reply(self, msg: Msg):
-        """Streaming reply — yields events and the final Msg for SSE."""
-        txn = self._extract_transaction(msg)
-        user_prompt = _build_user_prompt(txn)
-        await self.observe(UserMsg(name="user", content=user_prompt))
-
-        final_msg = None
-        async for event_or_msg in self._reply(inputs=msg):
-            if isinstance(event_or_msg, Msg):
-                final_msg = event_or_msg
-            else:
-                yield event_or_msg
-
-        if final_msg:
-            raw = final_msg.get_text_content() or ""
-            voucher = _parse_llm_response(raw, txn)
-            if voucher is None:
-                logger.warning("LLM voucher parsing failed, falling back to rule engine.")
-                voucher = _build_fallback_voucher(txn)
-            voucher_dict = _voucher_to_dict(voucher)
-            text = json.dumps(voucher_dict, ensure_ascii=False, default=str)
-            yield AssistantMsg(
-                id=final_msg.id,
-                name=self.name,
-                content=text,
-                metadata={"status": "generated", "voucher": voucher},
-            )
 
     def _extract_transaction(self, msg: Msg) -> SalesTransaction | ExpenseTransaction:
         """Extract transaction from message content or metadata."""
@@ -254,39 +227,3 @@ def _extract_json(text: str) -> str:
     if "```" in text:
         return text.split("```")[1].split("```")[0].strip()
     return text
-
-
-def _voucher_to_dict(voucher) -> dict:
-    """Convert a Voucher object to a frontend-compatible dict."""
-    rows = []
-    for line in voucher.lines:
-        debit = float(line.amount) if line.debit_credit == "S" else 0
-        credit = float(line.amount) if line.debit_credit == "H" else 0
-        rows.append({
-            "line_no": line.line_no,
-            "account_code": line.account_code,
-            "account_name": line.account_name,
-            "debit_credit": line.debit_credit,
-            "debit": debit,
-            "credit": credit,
-            "currency": line.currency,
-            "customer_code": line.customer_code,
-            "customer_name": line.customer_name,
-            "tax_code": line.tax_code,
-            "profit_center": line.profit_center,
-            "cost_center": line.cost_center,
-            "assignment": line.assignment,
-            "text": line.text,
-        })
-    return {
-        "voucher_id": voucher.voucher_id,
-        "company_code": voucher.company_code,
-        "document_type": voucher.document_type,
-        "document_date": voucher.document_date,
-        "posting_date": voucher.posting_date,
-        "reference": voucher.reference,
-        "header_text": voucher.header_text,
-        "confidence": str(voucher.confidence),
-        "warnings": voucher.warnings,
-        "rows": rows,
-    }
