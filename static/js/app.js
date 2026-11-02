@@ -162,7 +162,12 @@ function setupUIEvents() {
 function setupViewEvents() {
     // View switch events
     bus.on(EVENTS.VIEW_SWITCH, (data) => {
-        const { view, a2ui, refresh } = data;
+        const { view, a2ui, refresh, config } = data;
+
+        // ViewManager emits this event after it has already switched views.
+        // Ignore it here so the handler does not call switchTo() again
+        // (which would recurse until the call stack overflows).
+        if (config) return;
 
         // Handle A2UI rendering
         if (a2ui) {
