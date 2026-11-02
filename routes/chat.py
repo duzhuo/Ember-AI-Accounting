@@ -652,8 +652,10 @@ async def _handle_user_list(
     for u in users:
         u.pop("password_hash", None)
         u.pop("password_salt", None)
-    if not reply:
-        reply = f"当前共有 {len(users)} 个用户。"
+    # Always generate a deterministic reply. The LLM reply for a list action is
+    # often a raw echo of the user's message (e.g. "查询用户") or a generic
+    # greeting, which looks like the assistant did not respond.
+    reply = f"当前共有 {len(users)} 个用户。"
     await save_chat_message(session_id=chat_session_id, user_id=user["id"], role="assistant", content=reply, message_type="chat")
     yield _sse({"type": "result", "reply": reply, "session_id": session_id, "view": "user_list", "view_data": {"users": users}, "a2ui": {"messages": _users_to_a2ui(users)}})
 
